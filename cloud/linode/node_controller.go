@@ -71,7 +71,9 @@ func (s *nodeController) Run(stopCh <-chan struct{}) {
 		klog.Errorf("NodeController can't handle newly created node's metadata. %s", err)
 	}
 
+	klog.Infof("Starting wait.Until")
 	go wait.Until(s.worker, time.Second, stopCh)
+	klog.Infof("Finished wait.Until")
 	s.informer.Informer().Run(stopCh)
 }
 
@@ -83,6 +85,7 @@ func (s *nodeController) worker() {
 }
 
 func (s *nodeController) processNext() bool {
+	klog.Infof("Procesing new node from queue")
 	key, quit := s.queue.Get()
 	if quit {
 		return false
@@ -95,7 +98,9 @@ func (s *nodeController) processNext() bool {
 		return true
 	}
 
+	klog.Infof("Started processing node: (%s)", node.Name)
 	err := s.handleNode(context.TODO(), node)
+	klog.Infof("Finished processing node (%s)", node.Name)
 	switch deleteErr := err.(type) {
 	case nil:
 		break
