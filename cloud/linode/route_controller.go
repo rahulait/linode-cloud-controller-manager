@@ -42,14 +42,10 @@ func (rc *routeCache) refreshRoutes(ctx context.Context, client client.Client) e
 		if vpcName == "" {
 			continue
 		}
-		vpcID, err := GetVPCID(client, strings.TrimSpace(vpcName))
+		resp, err := GetVPCIPAddresses(ctx, client, vpcName)
 		if err != nil {
 			klog.Errorf("failed updating cache for VPC %s. Error: %s", vpcName, err.Error())
 			continue
-		}
-		resp, err := client.ListVPCIPAddresses(ctx, vpcID, linodego.NewListOptions(0, ""))
-		if err != nil {
-			return err
 		}
 		for _, r := range resp {
 			vpcNodes[r.LinodeID] = append(vpcNodes[r.LinodeID], r)
