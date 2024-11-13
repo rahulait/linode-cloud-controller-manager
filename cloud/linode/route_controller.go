@@ -27,12 +27,12 @@ type routeCache struct {
 }
 
 // RefreshCache checks if cache has expired and updates it accordingly
-func (rc *routeCache) refreshRoutes(ctx context.Context, client client.Client) error {
+func (rc *routeCache) refreshRoutes(ctx context.Context, client client.Client) {
 	rc.Mu.Lock()
 	defer rc.Mu.Unlock()
 
 	if time.Since(rc.lastUpdate) < rc.ttl {
-		return nil
+		return
 	}
 
 	vpcNodes := map[int][]linodego.VPCIP{}
@@ -54,7 +54,6 @@ func (rc *routeCache) refreshRoutes(ctx context.Context, client client.Client) e
 
 	rc.routes = vpcNodes
 	rc.lastUpdate = time.Now()
-	return nil
 }
 
 type routes struct {
@@ -100,10 +99,7 @@ func (r *routes) instanceRoutesByID(id int) ([]linodego.VPCIP, error) {
 // getInstanceRoutes returns routes for given instance id
 // It refreshes routeCache if it has expired
 func (r *routes) getInstanceRoutes(ctx context.Context, id int) ([]linodego.VPCIP, error) {
-	if err := r.routeCache.refreshRoutes(ctx, r.client); err != nil {
-		return nil, err
-	}
-
+	r.routeCache.refreshRoutes(ctx, r.client)
 	return r.instanceRoutesByID(id)
 }
 
