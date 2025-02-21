@@ -38,7 +38,7 @@ jobs:
           base: ${{ github.ref }}
           filters: .github/filters.yml
 
-  build-test:
+  codecov:
     runs-on: ubuntu-latest
     environment: ${{ github.event.pull_request.head.repo.fork == true && 'prod-external' || 'prod' }}
     needs: changes
@@ -61,8 +61,6 @@ jobs:
             api.codecov.io:443
             ingest.codecov.io:443
             raw.githubusercontent.com:443
-            get.helm.sh:443
-            golangci-lint.run:443
 
       - uses: actions/checkout@v4.2.2
         with:
