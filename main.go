@@ -59,7 +59,7 @@ func initializeSentry() {
 		return
 	}
 
-	fmt.Print("Sentry successfully initialized\n")
+	fmt.Print("Sentry initialized\n")
 }
 
 func main() {
