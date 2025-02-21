@@ -59,11 +59,11 @@ func initializeSentry() {
 		return
 	}
 
-	fmt.Print("Sentry successfully initialized\n")
+	fmt.Print("Sentry initialized\n")
 }
 
 func main() {
-	fmt.Printf("Linode Cloud Controller Manager starting up\n")
+	fmt.Printf("Linode Cloud Controller Manager (CCM) starting up\n")
 
 	initializeSentry()
 
