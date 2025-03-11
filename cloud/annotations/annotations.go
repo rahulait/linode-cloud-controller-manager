@@ -16,6 +16,7 @@ const (
 	AnnLinodeHealthCheckAttempts = "service.beta.kubernetes.io/linode-loadbalancer-check-attempts"
 	AnnLinodeHealthCheckPassive  = "service.beta.kubernetes.io/linode-loadbalancer-check-passive"
 
+	
 	// AnnLinodeThrottle is the annotation specifying the value of the Client Connection
 	// Throttle, which limits the number of subsequent new connections per second from the
 	// same client IP. Options are a number between 1-20, or 0 to disable. Defaults to 20.
