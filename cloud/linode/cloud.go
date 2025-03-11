@@ -28,6 +28,7 @@ const (
 	tokenHealthCheckPeriod = 5 * time.Minute
 )
 
+
 var supportedLoadBalancerTypes = []string{ciliumLBType, nodeBalancerLBType}
 
 // Options is a configuration object for this cloudprovider implementation.
