@@ -2,16 +2,22 @@ package linode
 
 import (
 	"context"
+	cryptoRand "crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 
+	ciliumclient "github.com/cilium/cilium/pkg/k8s/client/clientset/versioned/typed/cilium.io/v2alpha1"
 	"github.com/linode/linodego"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -20,6 +26,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/linode/linode-cloud-controller-manager/cloud/annotations"
+	"github.com/linode/linode-cloud-controller-manager/cloud/linode/client"
+	"github.com/linode/linode-cloud-controller-manager/cloud/linode/firewall"
 )
 
 const testCert string = `-----BEGIN CERTIFICATE-----
@@ -105,6 +115,8 @@ o/aoxqmE0mN1lyCPOa9UP//LlsREkWVKI3+Wld/xERtzf66hjcH+ilsXDxxpMEXo
 bSiPJQsGIKtQvyCaZY2szyOoeUGgOId+He7ITlezxKrjdj+1pLMESvAxKeo=
 -----END RSA PRIVATE KEY-----`
 
+const drop string = "DROP"
+
 func TestCCMLoadBalancers(t *testing.T) {
 	testCases := []struct {
 		name string
@@ -143,6 +155,26 @@ func TestCCMLoadBalancers(t *testing.T) {
 			f:    testCreateNodeBalanceWithNoAllowOrDenyList,
 		},
 		{
+			name: "Create Load Balancer With VPC Backend",
+			f:    testCreateNodeBalancerWithVPCBackend,
+		},
+		{
+			name: "Update Load Balancer With VPC Backend",
+			f:    testUpdateNodeBalancerWithVPCBackend,
+		},
+		{
+			name: "Create Load Balancer With VPC Backend - Overwrite VPC Name and Subnet with Annotation",
+			f:    testCreateNodeBalancerWithVPCAnnotationOverwrite,
+		},
+		{
+			name: "Create Load Balancer With Global Tags set",
+			f:    testCreateNodeBalancerWithGlobalTags,
+		},
+		{
+			name: "Update Load Balancer - Add Node",
+			f:    testUpdateLoadBalancerAddNode,
+		},
+		{
 			name: "Update Load Balancer - Add Annotation",
 			f:    testUpdateLoadBalancerAddAnnotation,
 		},
@@ -176,7 +208,11 @@ func TestCCMLoadBalancers(t *testing.T) {
 		},
 		{
 			name: "Update Load Balancer - Delete Firewall ID",
-			f:    testUpdateLoadBalancerDeleteFirewall,
+			f:    testUpdateLoadBalancerDeleteFirewallRemoveID,
+		},
+		{
+			name: "Update Load Balancer - Delete Firewall ACL",
+			f:    testUpdateLoadBalancerDeleteFirewallRemoveACL,
 		},
 		{
 			name: "Update Load Balancer - Update Firewall ACL",
@@ -227,6 +263,10 @@ func TestCCMLoadBalancers(t *testing.T) {
 			f:    testMakeLoadBalancerStatus,
 		},
 		{
+			name: "makeLoadBalancerStatusWithIPv6",
+			f:    testMakeLoadBalancerStatusWithIPv6,
+		},
+		{
 			name: "makeLoadBalancerStatusEnvVar",
 			f:    testMakeLoadBalancerStatusEnvVar,
 		},
@@ -237,6 +277,10 @@ func TestCCMLoadBalancers(t *testing.T) {
 		{
 			name: "Update Load Balancer - No Nodes",
 			f:    testUpdateLoadBalancerNoNodes,
+		},
+		{
+			name: "Create Load Balancer - Very long Service name",
+			f:    testVeryLongServiceName,
 		},
 	}
 
@@ -258,14 +302,16 @@ func stubService(fake *fake.Clientset, service *v1.Service) {
 	_, _ = fake.CoreV1().Services("").Create(context.TODO(), service, metav1.CreateOptions{})
 }
 
-func testCreateNodeBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI, annotations map[string]string) error {
+func testCreateNodeBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI, annMap map[string]string, expectedTags []string) error {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeThrottle:         "15",
-				annLinodeLoadBalancerTags: "fake,test,yolo",
+				annotations.AnnLinodeThrottle:         "15",
+				annotations.AnnLinodeLoadBalancerTags: "fake,test,yolo",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -285,14 +331,17 @@ func testCreateNodeBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI, a
 			},
 		},
 	}
-	for key, value := range annotations {
+	for key, value := range annMap {
 		svc.Annotations[key] = value
 	}
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	nodes := []*v1.Node{
 		{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}},
 	}
-	nb, err := lb.buildLoadBalancerRequest(context.TODO(), "linodelb", svc, nodes)
+	nb, err := lb.buildLoadBalancerRequest(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		return err
 	}
@@ -303,7 +352,7 @@ func testCreateNodeBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI, a
 		t.Logf("actual: %s", nb.Region)
 	}
 
-	configs, err := client.ListNodeBalancerConfigs(context.TODO(), nb.ID, nil)
+	configs, err := client.ListNodeBalancerConfigs(t.Context(), nb.ID, nil)
 	if err != nil {
 		return err
 	}
@@ -314,7 +363,7 @@ func testCreateNodeBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI, a
 		t.Logf("actual: %v", len(configs))
 	}
 
-	nb, err = client.GetNodeBalancer(context.TODO(), nb.ID)
+	nb, err = client.GetNodeBalancer(t.Context(), nb.ID)
 	if err != nil {
 		return err
 	}
@@ -325,17 +374,19 @@ func testCreateNodeBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI, a
 		t.Logf("actual: %v", nb.ClientConnThrottle)
 	}
 
-	expectedTags := []string{"linodelb", "fake", "test", "yolo"}
+	if len(expectedTags) == 0 {
+		expectedTags = []string{"linodelb", "fake", "test", "yolo"}
+	}
 	if !reflect.DeepEqual(nb.Tags, expectedTags) {
 		t.Error("unexpected Tags")
 		t.Logf("expected: %v", expectedTags)
 		t.Logf("actual: %v", nb.Tags)
 	}
 
-	_, ok := annotations[annLinodeCloudFirewallACL]
+	_, ok := annMap[annotations.AnnLinodeCloudFirewallACL]
 	if ok {
 		// a firewall was configured for this
-		firewalls, err := client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+		firewalls, err := client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 		if err != nil {
 			t.Errorf("Expected nil error, got %v", err)
 		}
@@ -345,104 +396,212 @@ func testCreateNodeBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI, a
 		}
 	}
 
-	defer func() { _ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc) }()
+	defer func() { _ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc) }()
 	return nil
 }
 
 func testCreateNodeBalancerWithOutFirewall(t *testing.T, client *linodego.Client, f *fakeAPI) {
-	err := testCreateNodeBalancer(t, client, f, nil)
+	t.Helper()
+
+	err := testCreateNodeBalancer(t, client, f, nil, nil)
 	if err != nil {
 		t.Fatalf("expected a nil error, got %v", err)
 	}
 }
 
 func testCreateNodeBalanceWithNoAllowOrDenyList(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
 	annotations := map[string]string{
-		annLinodeCloudFirewallACL: `{}`,
+		annotations.AnnLinodeCloudFirewallACL: `{}`,
 	}
 
-	err := testCreateNodeBalancer(t, client, f, annotations)
-	if err == nil || !stderrors.Is(err, errInvalidFWConfig) {
-		t.Fatalf("expected a %v error, got %v", errInvalidFWConfig, err)
+	err := testCreateNodeBalancer(t, client, f, annotations, nil)
+	if err == nil || !stderrors.Is(err, firewall.ErrInvalidFWConfig) {
+		t.Fatalf("expected a %v error, got %v", firewall.ErrInvalidFWConfig, err)
 	}
 }
 
 func testCreateNodeBalanceWithBothAllowOrDenyList(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
 	annotations := map[string]string{
-		annLinodeCloudFirewallACL: `{
+		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
-				"ipv4": ["2.2.2.2"]
+				"ipv4": ["2.2.2.2/32"],
+				"ipv6": ["2001:db8::/128"]
 			},
 			"denyList": {
-				"ipv4": ["2.2.2.2"]
+				"ipv4": ["2.2.2.2/32"],
+				"ipv6": ["2001:db8::/128"]
 			}
 		}`,
 	}
 
-	err := testCreateNodeBalancer(t, client, f, annotations)
-	if err == nil || !stderrors.Is(err, errInvalidFWConfig) {
-		t.Fatalf("expected a %v error, got %v", errInvalidFWConfig, err)
+	err := testCreateNodeBalancer(t, client, f, annotations, nil)
+	if err == nil || !stderrors.Is(err, firewall.ErrInvalidFWConfig) {
+		t.Fatalf("expected a %v error, got %v", firewall.ErrInvalidFWConfig, err)
 	}
 }
 
 func testCreateNodeBalancerWithAllowList(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
 	annotations := map[string]string{
-		annLinodeCloudFirewallACL: `{
+		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
-				"ipv4": ["2.2.2.2"]
+				"ipv4": ["2.2.2.2/32"],
+				"ipv6": ["2001:db8::/128"]
 			}
 		}`,
 	}
 
-	err := testCreateNodeBalancer(t, client, f, annotations)
+	err := testCreateNodeBalancer(t, client, f, annotations, nil)
 	if err != nil {
-		t.Fatalf("expected a non-nil error, got %v", err)
+		t.Fatalf("expected a nil error, got %v", err)
 	}
 }
 
 func testCreateNodeBalancerWithDenyList(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
 	annotations := map[string]string{
-		annLinodeCloudFirewallACL: `{
+		annotations.AnnLinodeCloudFirewallACL: `{
 			"denyList": {
-				"ipv4": ["2.2.2.2"]
+				"ipv4": ["2.2.2.2/32"],
+				"ipv6": ["2001:db8::/128"]
 			}
 		}`,
 	}
 
-	err := testCreateNodeBalancer(t, client, f, annotations)
+	err := testCreateNodeBalancer(t, client, f, annotations, nil)
 	if err != nil {
-		t.Fatalf("expected a non-nil error, got %v", err)
+		t.Fatalf("expected a nil error, got %v", err)
 	}
 }
 
 func testCreateNodeBalancerWithFirewall(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
 	annotations := map[string]string{
-		annLinodeCloudFirewallID: "123",
+		annotations.AnnLinodeCloudFirewallID: "123",
 	}
-	err := testCreateNodeBalancer(t, client, f, annotations)
+	err := testCreateNodeBalancer(t, client, f, annotations, nil)
 	if err != nil {
 		t.Fatalf("expected a nil error, got %v", err)
 	}
 }
 
 func testCreateNodeBalancerWithInvalidFirewall(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
 	annotations := map[string]string{
-		annLinodeCloudFirewallID: "qwerty",
+		annotations.AnnLinodeCloudFirewallID: "qwerty",
 	}
 	expectedError := "strconv.Atoi: parsing \"qwerty\": invalid syntax"
-	err := testCreateNodeBalancer(t, client, f, annotations)
+	err := testCreateNodeBalancer(t, client, f, annotations, nil)
 	if err.Error() != expectedError {
 		t.Fatalf("expected a %s error, got %v", expectedError, err)
 	}
 }
 
-func testUpdateLoadBalancerAddAnnotation(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+func testCreateNodeBalancerWithGlobalTags(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	original := Options.NodeBalancerTags
+	defer func() {
+		Options.NodeBalancerTags = original
+	}()
+	Options.NodeBalancerTags = []string{"foobar"}
+	expectedTags := []string{"linodelb", "foobar", "fake", "test", "yolo"}
+	err := testCreateNodeBalancer(t, client, f, nil, expectedTags)
+	if err != nil {
+		t.Fatalf("expected a nil error, got %v", err)
+	}
+}
+
+func testCreateNodeBalancerWithVPCBackend(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	// test when no VPCs are present
+	ann := map[string]string{
+		annotations.NodeBalancerBackendIPv4Range: "10.100.0.0/30",
+	}
+	if err := testCreateNodeBalancer(t, client, f, ann, nil); err == nil {
+		t.Fatalf("expected nodebalancer creation to fail")
+	}
+
+	f.ResetRequests()
+
+	// provision vpc and test again
+	vpcNames := Options.VPCNames
+	subnetNames := Options.SubnetNames
+	defer func() {
+		Options.VPCNames = vpcNames
+		Options.SubnetNames = subnetNames
+	}()
+	Options.VPCNames = "test1"
+	Options.SubnetNames = "default"
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test1",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: "default",
+				IPv4:  "10.0.0.0/8",
+			},
+		},
+	})
+
+	err := testCreateNodeBalancer(t, client, f, ann, nil)
+	if err != nil {
+		t.Fatalf("expected a nil error, got %v", err)
+	}
+
+	f.ResetRequests()
+
+	// test with IPv4Range outside of defined NodeBalancer subnet
+	nodebalancerBackendIPv4Subnet := Options.NodeBalancerBackendIPv4Subnet
+	defer func() {
+		Options.NodeBalancerBackendIPv4Subnet = nodebalancerBackendIPv4Subnet
+	}()
+	Options.NodeBalancerBackendIPv4Subnet = "10.99.0.0/24"
+	if err := testCreateNodeBalancer(t, client, f, ann, nil); err == nil {
+		t.Fatalf("expected nodebalancer creation to fail")
+	}
+}
+
+func testUpdateNodeBalancerWithVPCBackend(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	// provision vpc and test
+	vpcNames := Options.VPCNames
+	subnetNames := Options.SubnetNames
+	defer func() {
+		Options.VPCNames = vpcNames
+		Options.SubnetNames = subnetNames
+	}()
+	Options.VPCNames = "test1"
+	Options.SubnetNames = "default"
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test1",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: "default",
+				IPv4:  "10.0.0.0/8",
+			},
+		},
+	})
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeThrottle: "15",
+				annotations.NodeBalancerBackendIPv4Range: "10.100.0.0/30",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -470,15 +629,18 @@ func testUpdateLoadBalancerAddAnnotation(t *testing.T, client *linodego.Client, 
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
@@ -486,15 +648,321 @@ func testUpdateLoadBalancerAddAnnotation(t *testing.T, client *linodego.Client, 
 
 	stubService(fakeClientset, svc)
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeThrottle: "10",
+		annotations.NodeBalancerBackendIPv4Range: "10.100.1.0/30",
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
+	}
+}
+
+func testCreateNodeBalancerWithVPCAnnotationOverwrite(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	// provision multiple vpcs
+	vpcNames := Options.VPCNames
+	nodebalancerBackendIPv4Subnet := Options.NodeBalancerBackendIPv4Subnet
+	defer func() {
+		Options.VPCNames = vpcNames
+		Options.NodeBalancerBackendIPv4Subnet = nodebalancerBackendIPv4Subnet
+	}()
+	Options.VPCNames = "test1"
+	Options.NodeBalancerBackendIPv4Subnet = "10.100.0.0/24"
+
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test1",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: "default",
+				IPv4:  "10.0.0.0/8",
+			},
+		},
+	})
+
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test2",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: "subnet1",
+				IPv4:  "10.0.0.0/8",
+			},
+		},
+	})
+	ann := map[string]string{
+		annotations.NodeBalancerBackendIPv4Range:  "10.100.0.0/30",
+		annotations.NodeBalancerBackendVPCName:    "test2",
+		annotations.NodeBalancerBackendSubnetName: "subnet1",
+	}
+	err := testCreateNodeBalancer(t, client, f, ann, nil)
+	if err != nil {
+		t.Fatalf("expected a nil error, got %v", err)
+	}
+}
+
+func testUpdateLoadBalancerAddNode(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: randString(),
+			UID:  "foobar1234",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes1 := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "127.0.0.1",
+					},
+				},
+			},
+		},
+	}
+
+	nodes2 := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "127.0.0.1",
+					},
+				},
+			},
+		},
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "127.0.0.2",
+					},
+				},
+			},
+		},
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "127.0.0.3",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes1)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+
+	stubService(fakeClientset, svc)
+
+	f.ResetRequests()
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes1)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error while updated LB to have one node: %s", err)
+	}
+
+	rx := regexp.MustCompile("/nodebalancers/[0-9]+/configs/[0-9]+/rebuild")
+	checkIDs := func() (int, int) {
+		var req *fakeRequest
+		for request := range f.requests {
+			if rx.MatchString(request.Path) {
+				req = &request
+				break
+			}
+		}
+
+		if req == nil {
+			t.Fatalf("Nodebalancer config rebuild request was not called.")
+			return 0, 0 // explicitly return to satisfy staticcheck
+		}
+
+		var nbcro linodego.NodeBalancerConfigRebuildOptions
+
+		if err = json.Unmarshal([]byte(req.Body), &nbcro); err != nil {
+			t.Fatalf("Unable to unmarshall request body %#v, error: %#v", req.Body, err)
+		}
+
+		withIds := 0
+		for i := range nbcro.Nodes {
+			if nbcro.Nodes[i].ID > 0 {
+				withIds++
+			}
+		}
+
+		return len(nbcro.Nodes), withIds
+	}
+
+	nodecount, nodeswithIdcount := checkIDs()
+	if nodecount != 1 {
+		t.Fatalf("Unexpected node count (%d) in request on updating the nodebalancer with one node.", nodecount)
+	}
+	if nodeswithIdcount != 1 {
+		t.Fatalf("Expected Node ID to be set when updating the nodebalancer with the same node it had previously.")
+	}
+
+	f.ResetRequests()
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes2)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error while updated LB to have three nodes: %s", err)
+	}
+	nodecount, nodeswithIdcount = checkIDs()
+	if nodecount != 3 {
+		t.Fatalf("Unexpected node count (%d) in request on updating the nodebalancer with three nodes.", nodecount)
+	}
+	if nodeswithIdcount != 1 {
+		t.Fatalf("Expected ID to be set just on one node which was existing prior updating the node with three nodes, it is set on %d nodes", nodeswithIdcount)
+	}
+
+	f.ResetRequests()
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes2)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error while updated LB to have three nodes second time: %s", err)
+	}
+	nodecount, nodeswithIdcount = checkIDs()
+	if nodecount != 3 {
+		t.Fatalf("Unexpected node count (%d) in request on updating the nodebalancer with three nodes second time.", nodecount)
+	}
+	if nodeswithIdcount != 3 {
+		t.Fatalf("Expected ID to be set just on all three nodes when updating the NB with all three nodes which were pre-existing, instead it is set on %d nodes", nodeswithIdcount)
+	}
+
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
+	if err != nil {
+		t.Fatalf("failed to get NodeBalancer via status: %s", err)
+	}
+
+	cfgs, errConfigs := client.ListNodeBalancerConfigs(t.Context(), nb.ID, nil)
+	if errConfigs != nil {
+		t.Fatalf("error getting NodeBalancer configs: %v", errConfigs)
+	}
+
+	expectedPorts := map[int]struct{}{
+		80: {},
+	}
+
+	observedPorts := make(map[int]struct{})
+
+	for _, cfg := range cfgs {
+		nbnodes, errNodes := client.ListNodeBalancerNodes(t.Context(), nb.ID, cfg.ID, nil)
+		if errNodes != nil {
+			t.Errorf("error getting NodeBalancer nodes: %v", errNodes)
+		}
+
+		for _, node := range nbnodes {
+			t.Logf("Node %#v", node)
+		}
+
+		if len(nbnodes) != len(nodes2) {
+			t.Errorf("Expected %d nodes for port %d, got %d (%#v)", len(nodes2), cfg.Port, len(nbnodes), nbnodes)
+		}
+
+		observedPorts[cfg.Port] = struct{}{}
+	}
+
+	if !reflect.DeepEqual(expectedPorts, observedPorts) {
+		t.Errorf("NodeBalancer ports mismatch: expected %#v, got %#v", expectedPorts, observedPorts)
+	}
+}
+
+func testUpdateLoadBalancerAddAnnotation(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: randString(),
+			UID:  "foobar123",
+			Annotations: map[string]string{
+				annotations.AnnLinodeThrottle: "15",
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "127.0.0.1",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+
+	stubService(fakeClientset, svc)
+	svc.ObjectMeta.SetAnnotations(map[string]string{
+		annotations.AnnLinodeThrottle: "10",
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
 	}
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
@@ -507,8 +975,10 @@ func testUpdateLoadBalancerAddAnnotation(t *testing.T, client *linodego.Client, 
 }
 
 func testUpdateLoadBalancerAddPortAnnotation(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	targetTestPort := 80
-	portConfigAnnotation := fmt.Sprintf("%s%d", annLinodePortConfigPrefix, targetTestPort)
+	portConfigAnnotation := fmt.Sprintf("%s%d", annotations.AnnLinodePortConfigPrefix, targetTestPort)
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        randString(),
@@ -540,15 +1010,18 @@ func testUpdateLoadBalancerAddPortAnnotation(t *testing.T, client *linodego.Clie
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
@@ -559,17 +1032,17 @@ func testUpdateLoadBalancerAddPortAnnotation(t *testing.T, client *linodego.Clie
 		portConfigAnnotation: `{"protocol": "http"}`,
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Fatalf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
 	}
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer by status: %v", err)
 	}
 
-	cfgs, errConfigs := client.ListNodeBalancerConfigs(context.TODO(), nb.ID, nil)
+	cfgs, errConfigs := client.ListNodeBalancerConfigs(t.Context(), nb.ID, nil)
 	if errConfigs != nil {
 		t.Fatalf("error getting NodeBalancer configs: %v", errConfigs)
 	}
@@ -588,7 +1061,103 @@ func testUpdateLoadBalancerAddPortAnnotation(t *testing.T, client *linodego.Clie
 	}
 }
 
+func testVeryLongServiceName(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
+	ipv4DenyList := make([]string, 130)
+	ipv6DenyList := make([]string, 130)
+
+	for i := 0; i < len(ipv4DenyList); i++ {
+		ipv4DenyList[i] = fmt.Sprintf("192.168.1.%d/32", i)
+		ipv6DenyList[i] = fmt.Sprintf("2001:db8::%x/128", i)
+	}
+
+	var jsonV4DenyList, jsonV6DenyList []byte
+	jsonV4DenyList, err := json.Marshal(ipv4DenyList)
+	if err != nil {
+		t.Error("Could not marshal ipv4DenyList into json")
+	}
+	jsonV6DenyList, err = json.Marshal(ipv6DenyList)
+	if err != nil {
+		t.Error("Could not marshal ipv6DenyList into json")
+	}
+
+	denyListJSON := fmt.Sprintf(`{
+		"denyList": {
+			"ipv4": %s,
+			"ipv6": %s
+		}
+	}`, string(jsonV4DenyList), string(jsonV6DenyList))
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: strings.Repeat(randString(), 6),
+			UID:  "foobar123",
+			Annotations: map[string]string{
+				annotations.AnnLinodeCloudFirewallACL: denyListJSON,
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "127.0.0.1",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+	stubService(fakeClientset, svc)
+
+	svc.ObjectMeta.SetAnnotations(map[string]string{
+		annotations.AnnLinodeCloudFirewallACL: `{
+			"denyList": {
+				"ipv4": ["192.168.1.0/32"],
+				"ipv6": ["2001:db8::/128"]
+			}
+		}`,
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Fatalf("UpdateLoadBalancer returned an error with updated annotations: %s", err)
+	}
+}
+
 func testUpdateLoadBalancerAddTags(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        randString(),
@@ -620,16 +1189,19 @@ func testUpdateLoadBalancerAddTags(t *testing.T, client *linodego.Client, _ *fak
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 	clusterName := "linodelb"
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), clusterName, svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), clusterName, svc)
 	}()
 
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), clusterName, svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), clusterName, svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
@@ -638,15 +1210,15 @@ func testUpdateLoadBalancerAddTags(t *testing.T, client *linodego.Client, _ *fak
 
 	testTags := "test,new,tags"
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeLoadBalancerTags: testTags,
+		annotations.AnnLinodeLoadBalancerTags: testTags,
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), clusterName, svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), clusterName, svc, nodes)
 	if err != nil {
 		t.Fatalf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
 	}
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer by status: %v", err)
 	}
@@ -660,12 +1232,14 @@ func testUpdateLoadBalancerAddTags(t *testing.T, client *linodego.Client, _ *fak
 }
 
 func testUpdateLoadBalancerAddTLSPort(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeThrottle: "15",
+				annotations.AnnLinodeThrottle: "15",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -700,17 +1274,20 @@ func testUpdateLoadBalancerAddTLSPort(t *testing.T, client *linodego.Client, _ *
 		NodePort: int32(30001),
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 	addTLSSecret(t, lb.kubeClient)
 
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
@@ -719,19 +1296,19 @@ func testUpdateLoadBalancerAddTLSPort(t *testing.T, client *linodego.Client, _ *
 	stubService(fakeClientset, svc)
 	svc.Spec.Ports = append(svc.Spec.Ports, extraPort)
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodePortConfigPrefix + "443": `{ "protocol": "https", "tls-secret-name": "tls-secret"}`,
+		annotations.AnnLinodePortConfigPrefix + "443": `{ "protocol": "https", "tls-secret-name": "tls-secret"}`,
 	})
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Fatalf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
 	}
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	cfgs, errConfigs := client.ListNodeBalancerConfigs(context.TODO(), nb.ID, nil)
+	cfgs, errConfigs := client.ListNodeBalancerConfigs(t.Context(), nb.ID, nil)
 	if errConfigs != nil {
 		t.Fatalf("error getting NodeBalancer configs: %v", errConfigs)
 	}
@@ -744,7 +1321,7 @@ func testUpdateLoadBalancerAddTLSPort(t *testing.T, client *linodego.Client, _ *
 	observedPorts := make(map[int]struct{})
 
 	for _, cfg := range cfgs {
-		nodes, errNodes := client.ListNodeBalancerNodes(context.TODO(), nb.ID, cfg.ID, nil)
+		nodes, errNodes := client.ListNodeBalancerNodes(t.Context(), nb.ID, cfg.ID, nil)
 		if errNodes != nil {
 			t.Errorf("error getting NodeBalancer nodes: %v", errNodes)
 		}
@@ -762,6 +1339,8 @@ func testUpdateLoadBalancerAddTLSPort(t *testing.T, client *linodego.Client, _ *
 }
 
 func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	nodes := []*v1.Node{
 		{
 			Status: v1.NodeStatus{
@@ -775,7 +1354,10 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
@@ -822,9 +1404,9 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
 			}
 
 			defer func() {
-				_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+				_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 			}()
-			nodeBalancer, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{
+			nodeBalancer, err := client.CreateNodeBalancer(t.Context(), linodego.NodeBalancerCreateOptions{
 				Region: lb.zone,
 			})
 			if err != nil {
@@ -833,11 +1415,11 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
 
 			svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nodeBalancer)
 			svc.ObjectMeta.SetAnnotations(map[string]string{
-				annLinodeDefaultProxyProtocol: string(tc.proxyProtocolConfig),
+				annotations.AnnLinodeDefaultProxyProtocol: string(tc.proxyProtocolConfig),
 			})
 
 			stubService(fakeClientset, svc)
-			if err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes); err != nil {
+			if err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes); err != nil {
 				expectedErrMessage := fmt.Sprintf("invalid NodeBalancer proxy protocol value '%s'", tc.proxyProtocolConfig)
 				if tc.invalidErr && err.Error() == expectedErrMessage {
 					return
@@ -849,7 +1431,7 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
 				t.Fatal("expected UpdateLoadBalancer to return an error")
 			}
 
-			nodeBalancerConfigs, err := client.ListNodeBalancerConfigs(context.TODO(), nodeBalancer.ID, nil)
+			nodeBalancerConfigs, err := client.ListNodeBalancerConfigs(t.Context(), nodeBalancer.ID, nil)
 			if err != nil {
 				t.Fatalf("failed to get NodeBalancer: %s", err)
 			}
@@ -865,12 +1447,14 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
 }
 
 func testUpdateLoadBalancerAddNewFirewall(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeThrottle: "15",
+				annotations.AnnLinodeThrottle: "15",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -898,21 +1482,25 @@ func testUpdateLoadBalancerAddNewFirewall(t *testing.T, client *linodego.Client,
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
-	firewall, err := lb.createFirewall(context.TODO(), linodego.FirewallCreateOptions{
+	fwClient := firewall.LinodeClient{Client: client}
+	fw, err := fwClient.CreateFirewall(t.Context(), linodego.FirewallCreateOptions{
 		Label: "test",
 		Rules: linodego.FirewallRuleSet{Inbound: []linodego.FirewallRule{{
 			Action:      "ACCEPT",
@@ -929,24 +1517,24 @@ func testUpdateLoadBalancerAddNewFirewall(t *testing.T, client *linodego.Client,
 		t.Errorf("CreatingFirewall returned an error: %s", err)
 	}
 	defer func() {
-		_ = lb.deleteFirewall(context.TODO(), firewall)
+		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallID: strconv.Itoa(firewall.ID),
+		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
 	}
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewalls, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("failed to List Firewalls %s", err)
 	}
@@ -955,12 +1543,15 @@ func testUpdateLoadBalancerAddNewFirewall(t *testing.T, client *linodego.Client,
 		t.Fatalf("No attached firewalls found")
 	}
 
-	if firewalls[0].ID != firewall.ID {
+	if firewalls[0].ID != fw.ID {
 		t.Fatalf("Attached firewallID not matching with created firewall")
 	}
 }
 
+// This will also test the firewall with >255 IPs
 func testUpdateLoadBalancerAddNewFirewallACL(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
@@ -991,26 +1582,29 @@ func testUpdateLoadBalancerAddNewFirewallACL(t *testing.T, client *linodego.Clie
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewalls, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failed to list nodeBalancer firewalls %s", err)
 	}
@@ -1019,25 +1613,56 @@ func testUpdateLoadBalancerAddNewFirewallACL(t *testing.T, client *linodego.Clie
 		t.Fatalf("Firewalls attached when none specified")
 	}
 
+	ipv4s := make([]string, 0, 400)
+	ipv6s := make([]string, 0, 300)
+	i := 0
+	for i < 400 {
+		ipv4s = append(ipv4s, fmt.Sprintf("%d.%d.%d.%d", 192, rand.Int31n(255), rand.Int31n(255), rand.Int31n(255)))
+		i += 1
+	}
+	i = 0
+	for i < 300 {
+		ip := make([]byte, 16)
+		if _, err = cryptoRand.Read(ip); err != nil {
+			t.Fatalf("unable to read random bytes")
+		}
+		ipv6s = append(ipv6s, fmt.Sprintf("%s:%s:%s:%s:%s:%s:%s:%s",
+			hex.EncodeToString(ip[0:2]),
+			hex.EncodeToString(ip[2:4]),
+			hex.EncodeToString(ip[4:6]),
+			hex.EncodeToString(ip[6:8]),
+			hex.EncodeToString(ip[8:10]),
+			hex.EncodeToString(ip[10:12]),
+			hex.EncodeToString(ip[12:14]),
+			hex.EncodeToString(ip[14:16])))
+		i += 1
+	}
+	acl := map[string]map[string][]string{
+		"allowList": {
+			"ipv4": ipv4s,
+			"ipv6": ipv6s,
+		},
+	}
+	aclString, err := json.Marshal(acl)
+	if err != nil {
+		t.Fatalf("unable to marshal json acl")
+	}
+
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallACL: `{
-			"allowList": {
-				"ipv4": ["2.2.2.2"]
-			}
-		}`,
+		annotations.AnnLinodeCloudFirewallACL: string(aclString),
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
 	}
 
-	nbUpdated, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nbUpdated, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nbUpdated.ID, &linodego.ListOptions{})
+	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nbUpdated.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("failed to List Firewalls %s", err)
 	}
@@ -1046,17 +1671,18 @@ func testUpdateLoadBalancerAddNewFirewallACL(t *testing.T, client *linodego.Clie
 		t.Fatalf("No firewalls found")
 	}
 
-	if firewallsNew[0].Rules.InboundPolicy != "DROP" {
+	if firewallsNew[0].Rules.InboundPolicy != drop {
 		t.Errorf("expected DROP inbound policy, got %s", firewallsNew[0].Rules.InboundPolicy)
 	}
 
-	fwIPs := firewallsNew[0].Rules.Inbound[0].Addresses.IPv4
-	if fwIPs == nil {
-		t.Errorf("expected 2.2.2.2, got %v", fwIPs)
+	if len(firewallsNew[0].Rules.Inbound) != 4 {
+		t.Errorf("expected 4 rules, got %d", len(firewallsNew[0].Rules.Inbound))
 	}
 }
 
-func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+func testUpdateLoadBalancerDeleteFirewallRemoveACL(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
@@ -1087,12 +1713,15 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallACL: `{
+		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["2.2.2.2"]
 			}
@@ -1100,21 +1729,21 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 	})
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewalls, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failed to list nodeBalancer firewalls %s", err)
 	}
@@ -1123,7 +1752,7 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 		t.Fatalf("No firewalls attached")
 	}
 
-	if firewalls[0].Rules.InboundPolicy != "DROP" {
+	if firewalls[0].Rules.InboundPolicy != drop {
 		t.Errorf("expected DROP inbound policy, got %s", firewalls[0].Rules.InboundPolicy)
 	}
 
@@ -1132,7 +1761,106 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 		t.Errorf("expected IP, got %v", fwIPs)
 	}
 
-	firewall, err := lb.createFirewall(context.TODO(), linodego.FirewallCreateOptions{
+	svc.ObjectMeta.SetAnnotations(map[string]string{})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
+	}
+
+	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to List Firewalls %s", err)
+	}
+
+	if len(firewallsNew) != 0 {
+		t.Fatalf("firewall's %d still attached", firewallsNew[0].ID)
+	}
+}
+
+func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: randString(),
+			UID:  "foobar123",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "127.0.0.1",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	svc.ObjectMeta.SetAnnotations(map[string]string{
+		annotations.AnnLinodeCloudFirewallACL: `{
+			"allowList": {
+				"ipv4": ["2.2.2.2"]
+			}
+		}`,
+	})
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+	stubService(fakeClientset, svc)
+
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
+	if err != nil {
+		t.Fatalf("failed to get NodeBalancer via status: %s", err)
+	}
+
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
+	if err != nil {
+		t.Fatalf("Failed to list nodeBalancer firewalls %s", err)
+	}
+
+	if len(firewalls) == 0 {
+		t.Fatalf("No firewalls attached")
+	}
+
+	if firewalls[0].Rules.InboundPolicy != drop {
+		t.Errorf("expected DROP inbound policy, got %s", firewalls[0].Rules.InboundPolicy)
+	}
+
+	fwIPs := firewalls[0].Rules.Inbound[0].Addresses.IPv4
+	if fwIPs == nil {
+		t.Errorf("expected IP, got %v", fwIPs)
+	}
+
+	fwClient := firewall.LinodeClient{Client: client}
+	fw, err := fwClient.CreateFirewall(t.Context(), linodego.FirewallCreateOptions{
 		Label: "test",
 		Rules: linodego.FirewallRuleSet{Inbound: []linodego.FirewallRule{{
 			Action:      "ACCEPT",
@@ -1149,24 +1877,24 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 		t.Errorf("Error creating firewall %s", err)
 	}
 	defer func() {
-		_ = lb.deleteFirewall(context.TODO(), firewall)
+		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallID: strconv.Itoa(firewall.ID),
+		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
 	}
 
-	nbUpdated, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nbUpdated, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nbUpdated.ID, &linodego.ListOptions{})
+	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nbUpdated.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("failed to List Firewalls %s", err)
 	}
@@ -1184,12 +1912,14 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 		t.Errorf("expected 2.2.2.2, got %v", fwIPs)
 	}
 
-	if firewallsNew[0].ID != firewall.ID {
+	if firewallsNew[0].ID != fw.ID {
 		t.Errorf("Firewall ID does not match what we created, something wrong.")
 	}
 }
 
 func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
@@ -1220,11 +1950,15 @@ func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *li
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
-	firewall, err := lb.createFirewall(context.TODO(), linodego.FirewallCreateOptions{
+	fwClient := firewall.LinodeClient{Client: client}
+	fw, err := fwClient.CreateFirewall(t.Context(), linodego.FirewallCreateOptions{
 		Label: "test",
 		Rules: linodego.FirewallRuleSet{Inbound: []linodego.FirewallRule{{
 			Action:      "ACCEPT",
@@ -1241,29 +1975,29 @@ func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *li
 		t.Errorf("Error creating firewall %s", err)
 	}
 	defer func() {
-		_ = lb.deleteFirewall(context.TODO(), firewall)
+		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallID: strconv.Itoa(firewall.ID),
+		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewalls, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failed to list nodeBalancer firewalls %s", err)
 	}
@@ -1281,24 +2015,24 @@ func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *li
 		t.Errorf("expected IP, got %v", fwIPs)
 	}
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallACL: `{
+		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["2.2.2.2"]
 			}
 		}`,
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
 	}
 
-	nbUpdated, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nbUpdated, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nbUpdated.ID, &linodego.ListOptions{})
+	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nbUpdated.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("failed to List Firewalls %s", err)
 	}
@@ -1307,7 +2041,7 @@ func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *li
 		t.Fatalf("No attached firewalls found")
 	}
 
-	if firewallsNew[0].Rules.InboundPolicy != "DROP" {
+	if firewallsNew[0].Rules.InboundPolicy != drop {
 		t.Errorf("expected DROP inbound policy, got %s", firewallsNew[0].Rules.InboundPolicy)
 	}
 
@@ -1316,20 +2050,22 @@ func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *li
 		t.Errorf("expected 2.2.2.2, got %v", fwIPs)
 	}
 
-	if firewallsNew[0].ID != firewall.ID {
+	if firewallsNew[0].ID != fw.ID {
 		t.Errorf("Firewall ID does not match, something wrong.")
 	}
 }
 
 func testUpdateLoadBalancerUpdateFirewallACL(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: randString(),
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeCloudFirewallACL: `{
+				annotations.AnnLinodeCloudFirewallACL: `{
 					"allowList": {
-						"ipv4": ["2.2.2.2"]
+						"ipv4": ["2.2.2.2/32", "3.3.3.3/32"]
 					}
 				}`,
 			},
@@ -1359,26 +2095,29 @@ func testUpdateLoadBalancerUpdateFirewallACL(t *testing.T, client *linodego.Clie
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewalls, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failed to list nodeBalancer firewalls %s", err)
 	}
@@ -1387,37 +2126,128 @@ func testUpdateLoadBalancerUpdateFirewallACL(t *testing.T, client *linodego.Clie
 		t.Fatalf("No firewalls attached")
 	}
 
-	if firewalls[0].Rules.InboundPolicy != "DROP" {
+	if firewalls[0].Rules.InboundPolicy != drop {
 		t.Errorf("expected DROP inbound policy, got %s", firewalls[0].Rules.InboundPolicy)
 	}
 
 	fwIPs := firewalls[0].Rules.Inbound[0].Addresses.IPv4
 	if fwIPs == nil {
-		t.Errorf("expected 2.2.2.2, got %v", fwIPs)
+		t.Errorf("expected ips, got %v", fwIPs)
 	}
 
-	fmt.Printf("got %v", fwIPs)
-
+	// Add ipv6 ips in allowList
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallACL: `{
+		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
-				"ipv4": ["2.2.2.2"],
+				"ipv4": ["2.2.2.2/32", "3.3.3.3/32"],
+				"ipv6": ["dead:beef::/128", "dead:bee::/128"]
+			}
+		}`,
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
+	}
+
+	nbUpdated, err := lb.getNodeBalancerByStatus(t.Context(), svc)
+	if err != nil {
+		t.Fatalf("failed to get NodeBalancer via status: %s", err)
+	}
+
+	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nbUpdated.ID, &linodego.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to List Firewalls %s", err)
+	}
+
+	if len(firewallsNew) == 0 {
+		t.Fatalf("No attached firewalls found")
+	}
+
+	fwIPs = firewallsNew[0].Rules.Inbound[0].Addresses.IPv4
+	if fwIPs == nil {
+		t.Errorf("expected non nil IPv4, got %v", fwIPs)
+	}
+
+	if len(*fwIPs) != 2 {
+		t.Errorf("expected two IPv4 ips, got %v", fwIPs)
+	}
+
+	if firewallsNew[0].Rules.Inbound[0].Addresses.IPv6 == nil {
+		t.Errorf("expected non nil IPv6, got %v", firewallsNew[0].Rules.Inbound[0].Addresses.IPv6)
+	}
+
+	if len(*firewallsNew[0].Rules.Inbound[0].Addresses.IPv6) != 2 {
+		t.Errorf("expected two IPv6 ips, got %v", firewallsNew[0].Rules.Inbound[0].Addresses.IPv6)
+	}
+
+	// Update ips in allowList
+	svc.ObjectMeta.SetAnnotations(map[string]string{
+		annotations.AnnLinodeCloudFirewallACL: `{
+			"allowList": {
+				"ipv4": ["2.2.2.1/32", "3.3.3.3/32"],
+				"ipv6": ["dead::/128", "dead:bee::/128"]
+			}
+		}`,
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
+	}
+
+	nbUpdated, err = lb.getNodeBalancerByStatus(t.Context(), svc)
+	if err != nil {
+		t.Fatalf("failed to get NodeBalancer via status: %s", err)
+	}
+
+	firewallsNew, err = lb.client.ListNodeBalancerFirewalls(t.Context(), nbUpdated.ID, &linodego.ListOptions{})
+	if err != nil {
+		t.Fatalf("failed to List Firewalls %s", err)
+	}
+
+	if len(firewallsNew) == 0 {
+		t.Fatalf("No attached firewalls found")
+	}
+
+	fwIPs = firewallsNew[0].Rules.Inbound[0].Addresses.IPv4
+	if fwIPs == nil {
+		t.Errorf("expected non nil IPv4, got %v", fwIPs)
+	}
+
+	if len(*fwIPs) != 2 {
+		t.Errorf("expected two IPv4 ips, got %v", fwIPs)
+	}
+
+	if firewallsNew[0].Rules.Inbound[0].Addresses.IPv6 == nil {
+		t.Errorf("expected non nil IPv6, got %v", firewallsNew[0].Rules.Inbound[0].Addresses.IPv6)
+	}
+
+	if len(*firewallsNew[0].Rules.Inbound[0].Addresses.IPv6) != 2 {
+		t.Errorf("expected two IPv6 ips, got %v", firewallsNew[0].Rules.Inbound[0].Addresses.IPv6)
+	}
+
+	// remove one ipv4 and one ipv6 ip from allowList
+	svc.ObjectMeta.SetAnnotations(map[string]string{
+		annotations.AnnLinodeCloudFirewallACL: `{
+			"allowList": {
+				"ipv4": ["3.3.3.3/32"],
 				"ipv6": ["dead:beef::/128"]
 			}
 		}`,
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
 	}
 
-	nbUpdated, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nbUpdated, err = lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nbUpdated.ID, &linodego.ListOptions{})
+	firewallsNew, err = lb.client.ListNodeBalancerFirewalls(t.Context(), nbUpdated.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("failed to List Firewalls %s", err)
 	}
@@ -1442,9 +2272,17 @@ func testUpdateLoadBalancerUpdateFirewallACL(t *testing.T, client *linodego.Clie
 	if len(*firewallsNew[0].Rules.Inbound[0].Addresses.IPv6) != 1 {
 		t.Errorf("expected one IPv6, got %v", firewallsNew[0].Rules.Inbound[0].Addresses.IPv6)
 	}
+
+	// Run update with same ACL
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
+	}
 }
 
 func testUpdateLoadBalancerUpdateFirewall(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	firewallCreateOpts := linodego.FirewallCreateOptions{
 		Label: "test",
 		Rules: linodego.FirewallRuleSet{Inbound: []linodego.FirewallRule{{
@@ -1464,7 +2302,7 @@ func testUpdateLoadBalancerUpdateFirewall(t *testing.T, client *linodego.Client,
 			Name: randString(),
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeThrottle: "15",
+				annotations.AnnLinodeThrottle: "15",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -1492,38 +2330,42 @@ func testUpdateLoadBalancerUpdateFirewall(t *testing.T, client *linodego.Client,
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
-	firewall, err := lb.createFirewall(context.TODO(), firewallCreateOpts)
+	fwClient := firewall.LinodeClient{Client: client}
+	fw, err := fwClient.CreateFirewall(t.Context(), firewallCreateOpts)
 	if err != nil {
 		t.Errorf("Error creating firewall %s", err)
 	}
 	defer func() {
-		_ = lb.deleteFirewall(context.TODO(), firewall)
+		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallID: strconv.Itoa(firewall.ID),
+		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewalls, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failed to list nodeBalancer firewalls %s", err)
 	}
@@ -1532,34 +2374,34 @@ func testUpdateLoadBalancerUpdateFirewall(t *testing.T, client *linodego.Client,
 		t.Fatalf("No firewalls attached")
 	}
 
-	if firewall.ID != firewalls[0].ID {
+	if fw.ID != firewalls[0].ID {
 		t.Fatalf("Attached firewallID not matching with created firewall")
 	}
 
 	firewallCreateOpts.Label = "test2"
-	firewallNew, err := lb.createFirewall(context.TODO(), firewallCreateOpts)
+	firewallNew, err := fwClient.CreateFirewall(t.Context(), firewallCreateOpts)
 	if err != nil {
 		t.Fatalf("Error in creating firewall %s", err)
 	}
 	defer func() {
-		_ = lb.deleteFirewall(context.TODO(), firewallNew)
+		_ = fwClient.DeleteFirewall(t.Context(), firewallNew)
 	}()
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallID: strconv.Itoa(firewallNew.ID),
+		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(firewallNew.ID),
 	})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
 	}
 
-	nbUpdated, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nbUpdated, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nbUpdated.ID, &linodego.ListOptions{})
+	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nbUpdated.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("failed to List Firewalls %s", err)
 	}
@@ -1573,7 +2415,9 @@ func testUpdateLoadBalancerUpdateFirewall(t *testing.T, client *linodego.Client,
 	}
 }
 
-func testUpdateLoadBalancerDeleteFirewall(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+func testUpdateLoadBalancerDeleteFirewallRemoveID(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	firewallCreateOpts := linodego.FirewallCreateOptions{
 		Label: "test",
 		Rules: linodego.FirewallRuleSet{Inbound: []linodego.FirewallRule{{
@@ -1618,39 +2462,43 @@ func testUpdateLoadBalancerDeleteFirewall(t *testing.T, client *linodego.Client,
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
-	firewall, err := lb.createFirewall(context.TODO(), firewallCreateOpts)
+	fwClient := firewall.LinodeClient{Client: client}
+	fw, err := fwClient.CreateFirewall(t.Context(), firewallCreateOpts)
 	if err != nil {
 		t.Errorf("Error in creating firewall %s", err)
 	}
 	defer func() {
-		_ = lb.deleteFirewall(context.TODO(), firewall)
+		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeCloudFirewallID: strconv.Itoa(firewall.ID),
+		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
-	lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
 	}
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	nb, err := lb.getNodeBalancerByStatus(context.TODO(), svc)
+	nb, err := lb.getNodeBalancerByStatus(t.Context(), svc)
 	if err != nil {
 		t.Fatalf("failed to get NodeBalancer via status: %s", err)
 	}
 
-	firewalls, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewalls, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Errorf("Error in listing firewalls %s", err)
 	}
@@ -1659,18 +2507,18 @@ func testUpdateLoadBalancerDeleteFirewall(t *testing.T, client *linodego.Client,
 		t.Fatalf("No firewalls attached")
 	}
 
-	if firewall.ID != firewalls[0].ID {
+	if fw.ID != firewalls[0].ID {
 		t.Fatalf("Attached firewallID not matching with created firewall")
 	}
 
 	svc.ObjectMeta.SetAnnotations(map[string]string{})
 
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error: %s", err)
 	}
 
-	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(context.TODO(), nb.ID, &linodego.ListOptions{})
+	firewallsNew, err := lb.client.ListNodeBalancerFirewalls(t.Context(), nb.ID, &linodego.ListOptions{})
 	if err != nil {
 		t.Fatalf("failed to List Firewalls %s", err)
 	}
@@ -1681,6 +2529,8 @@ func testUpdateLoadBalancerDeleteFirewall(t *testing.T, client *linodego.Client,
 }
 
 func testUpdateLoadBalancerAddNodeBalancerID(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        randString(),
@@ -1712,15 +2562,18 @@ func testUpdateLoadBalancerAddNodeBalancerID(t *testing.T, client *linodego.Clie
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
-	nodeBalancer, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{
+	nodeBalancer, err := client.CreateNodeBalancer(t.Context(), linodego.NodeBalancerCreateOptions{
 		Region: lb.zone,
 	})
 	if err != nil {
@@ -1729,7 +2582,7 @@ func testUpdateLoadBalancerAddNodeBalancerID(t *testing.T, client *linodego.Clie
 
 	svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nodeBalancer)
 
-	newNodeBalancer, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{
+	newNodeBalancer, err := client.CreateNodeBalancer(t.Context(), linodego.NodeBalancerCreateOptions{
 		Region: lb.zone,
 	})
 	if err != nil {
@@ -1738,14 +2591,15 @@ func testUpdateLoadBalancerAddNodeBalancerID(t *testing.T, client *linodego.Clie
 
 	stubService(fakeClientset, svc)
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeNodeBalancerID: strconv.Itoa(newNodeBalancer.ID),
+		annotations.AnnLinodeNodeBalancerID: strconv.Itoa(newNodeBalancer.ID),
 	})
-	err = lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Errorf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
 	}
 
-	lbStatus, _, err := lb.GetLoadBalancer(context.TODO(), svc.ClusterName, svc)
+	clusterName := strings.TrimPrefix(svc.Namespace, "kube-system-")
+	lbStatus, _, err := lb.GetLoadBalancer(t.Context(), clusterName, svc)
 	if err != nil {
 		t.Errorf("GetLoadBalancer returned an error: %s", err)
 	}
@@ -1775,7 +2629,7 @@ func Test_getConnectionThrottle(t *testing.T) {
 					Annotations: map[string]string{},
 				},
 			},
-			20,
+			0,
 		},
 		{
 			"throttle value is a string",
@@ -1784,11 +2638,11 @@ func Test_getConnectionThrottle(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeThrottle: "foo",
+						annotations.AnnLinodeThrottle: "foo",
 					},
 				},
 			},
-			20,
+			0,
 		},
 		{
 			"throttle value is less than 0",
@@ -1797,7 +2651,7 @@ func Test_getConnectionThrottle(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeThrottle: "-123",
+						annotations.AnnLinodeThrottle: "-123",
 					},
 				},
 			},
@@ -1810,7 +2664,7 @@ func Test_getConnectionThrottle(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeThrottle: "1",
+						annotations.AnnLinodeThrottle: "1",
 					},
 				},
 			},
@@ -1823,7 +2677,7 @@ func Test_getConnectionThrottle(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeThrottle: "21",
+						annotations.AnnLinodeThrottle: "21",
 					},
 				},
 			},
@@ -1867,7 +2721,7 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeDefaultProxyProtocol: string(linodego.ProxyProtocolV2),
+						annotations.AnnLinodeDefaultProxyProtocol: string(linodego.ProxyProtocolV2),
 					},
 				},
 			},
@@ -1881,8 +2735,8 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeDefaultProxyProtocol:     string(linodego.ProxyProtocolV2),
-						annLinodePortConfigPrefix + "443": fmt.Sprintf(`{"proxy-protocol": "%s"}`, linodego.ProxyProtocolV1),
+						annotations.AnnLinodeDefaultProxyProtocol:     string(linodego.ProxyProtocolV2),
+						annotations.AnnLinodePortConfigPrefix + "443": fmt.Sprintf(`{"proxy-protocol": "%s"}`, linodego.ProxyProtocolV1),
 					},
 				},
 			},
@@ -1896,7 +2750,7 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeDefaultProxyProtocol: "invalid",
+						annotations.AnnLinodeDefaultProxyProtocol: "invalid",
 					},
 				},
 			},
@@ -1922,7 +2776,7 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeDefaultProtocol: "tcp",
+						annotations.AnnLinodeDefaultProtocol: "tcp",
 					},
 				},
 			},
@@ -1936,7 +2790,7 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeDefaultProtocol: "HTTP",
+						annotations.AnnLinodeDefaultProtocol: "HTTP",
 					},
 				},
 			},
@@ -1950,7 +2804,7 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeDefaultProtocol: "invalid",
+						annotations.AnnLinodeDefaultProtocol: "invalid",
 					},
 				},
 			},
@@ -1964,8 +2818,8 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeDefaultProtocol:          "http",
-						annLinodePortConfigPrefix + "443": `{}`,
+						annotations.AnnLinodeDefaultProtocol:          "http",
+						annotations.AnnLinodePortConfigPrefix + "443": `{}`,
 					},
 				},
 			},
@@ -1979,7 +2833,7 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodePortConfigPrefix + "443": `{ "protocol": "HTTp" }`,
+						annotations.AnnLinodePortConfigPrefix + "443": `{ "protocol": "HTTp" }`,
 					},
 				},
 			},
@@ -1993,7 +2847,7 @@ func Test_getPortConfig(t *testing.T) {
 					Name: randString(),
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodePortConfigPrefix + "443": `{ "protocol": "invalid" }`,
+						annotations.AnnLinodePortConfigPrefix + "443": `{ "protocol": "invalid" }`,
 					},
 				},
 			},
@@ -2005,12 +2859,12 @@ func Test_getPortConfig(t *testing.T) {
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
 			testPort := 443
-			portConfig, err := getPortConfig(test.service, testPort)
+			portConfigResult, err := getPortConfig(test.service, testPort)
 
-			if !reflect.DeepEqual(portConfig, test.expectedPortConfig) {
+			if !reflect.DeepEqual(portConfigResult, test.expectedPortConfig) {
 				t.Error("unexpected port config")
 				t.Logf("expected: %q", test.expectedPortConfig)
-				t.Logf("actual: %q", portConfig)
+				t.Logf("actual: %q", portConfigResult)
 			}
 
 			if !reflect.DeepEqual(err, test.err) {
@@ -2048,7 +2902,7 @@ func Test_getHealthCheckType(t *testing.T) {
 					Name: "test",
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeHealthCheckType: "http",
+						annotations.AnnLinodeHealthCheckType: "http",
 					},
 				},
 			},
@@ -2062,12 +2916,12 @@ func Test_getHealthCheckType(t *testing.T) {
 					Name: "test",
 					UID:  "abc123",
 					Annotations: map[string]string{
-						annLinodeHealthCheckType: "invalid",
+						annotations.AnnLinodeHealthCheckType: "invalid",
 					},
 				},
 			},
 			"",
-			fmt.Errorf("invalid health check type: %q specified in annotation: %q", "invalid", annLinodeHealthCheckType),
+			fmt.Errorf("invalid health check type: %q specified in annotation: %q", "invalid", annotations.AnnLinodeHealthCheckType),
 		},
 	}
 
@@ -2091,9 +2945,10 @@ func Test_getHealthCheckType(t *testing.T) {
 
 func Test_getNodePrivateIP(t *testing.T) {
 	testcases := []struct {
-		name    string
-		node    *v1.Node
-		address string
+		name     string
+		node     *v1.Node
+		address  string
+		subnetID int
 	}{
 		{
 			"node internal ip specified",
@@ -2108,6 +2963,7 @@ func Test_getNodePrivateIP(t *testing.T) {
 				},
 			},
 			"127.0.0.1",
+			0,
 		},
 		{
 			"node internal ip not specified",
@@ -2122,13 +2978,14 @@ func Test_getNodePrivateIP(t *testing.T) {
 				},
 			},
 			"",
+			0,
 		},
 		{
 			"node internal ip annotation present",
 			&v1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
-						annLinodeNodePrivateIP: "192.168.42.42",
+						annotations.AnnLinodeNodePrivateIP: "192.168.42.42",
 					},
 				},
 				Status: v1.NodeStatus{
@@ -2141,12 +2998,33 @@ func Test_getNodePrivateIP(t *testing.T) {
 				},
 			},
 			"192.168.42.42",
+			0,
+		},
+		{
+			"node internal ip annotation present and subnet id is not zero",
+			&v1.Node{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						annotations.AnnLinodeNodePrivateIP: "192.168.42.42",
+					},
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{
+							Type:    v1.NodeInternalIP,
+							Address: "10.0.1.1",
+						},
+					},
+				},
+			},
+			"10.0.1.1",
+			100,
 		},
 	}
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			ip := getNodePrivateIP(test.node)
+			ip := getNodePrivateIP(test.node, test.subnetID)
 			if ip != test.address {
 				t.Error("unexpected certificate")
 				t.Logf("expected: %q", test.address)
@@ -2157,12 +3035,14 @@ func Test_getNodePrivateIP(t *testing.T) {
 }
 
 func testBuildLoadBalancerRequest(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test",
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeDefaultProtocol: "tcp",
+				annotations.AnnLinodeDefaultProtocol: "tcp",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -2194,8 +3074,11 @@ func testBuildLoadBalancerRequest(t *testing.T, client *linodego.Client, _ *fake
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
-	nb, err := lb.buildLoadBalancerRequest(context.TODO(), "linodelb", svc, nodes)
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	nb, err := lb.buildLoadBalancerRequest(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2206,7 +3089,7 @@ func testBuildLoadBalancerRequest(t *testing.T, client *linodego.Client, _ *fake
 		t.Logf("actual: %v", err)
 	}
 
-	configs, err := client.ListNodeBalancerConfigs(context.TODO(), nb.ID, nil)
+	configs, err := client.ListNodeBalancerConfigs(t.Context(), nb.ID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2217,7 +3100,7 @@ func testBuildLoadBalancerRequest(t *testing.T, client *linodego.Client, _ *fake
 		t.Logf("actual: %v", len(configs))
 	}
 
-	nbNodes, err := client.ListNodeBalancerNodes(context.TODO(), nb.ID, configs[0].ID, nil)
+	nbNodes, err := client.ListNodeBalancerNodes(t.Context(), nb.ID, configs[0].ID, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2230,6 +3113,8 @@ func testBuildLoadBalancerRequest(t *testing.T, client *linodego.Client, _ *fake
 }
 
 func testEnsureLoadBalancerPreserveAnnotation(t *testing.T, client *linodego.Client, fake *fakeAPI) {
+	t.Helper()
+
 	testServiceSpec := v1.ServiceSpec{
 		Ports: []v1.ServicePort{
 			{
@@ -2241,7 +3126,10 @@ func testEnsureLoadBalancerPreserveAnnotation(t *testing.T, client *linodego.Cli
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	for _, test := range []struct {
 		name        string
 		deleted     bool
@@ -2249,17 +3137,17 @@ func testEnsureLoadBalancerPreserveAnnotation(t *testing.T, client *linodego.Cli
 	}{
 		{
 			name:        "load balancer preserved",
-			annotations: map[string]string{annLinodeLoadBalancerPreserve: "true"},
+			annotations: map[string]string{annotations.AnnLinodeLoadBalancerPreserve: "true"},
 			deleted:     false,
 		},
 		{
 			name:        "load balancer not preserved (deleted)",
-			annotations: map[string]string{annLinodeLoadBalancerPreserve: "false"},
+			annotations: map[string]string{annotations.AnnLinodeLoadBalancerPreserve: "false"},
 			deleted:     true,
 		},
 		{
 			name:        "invalid value treated as false (deleted)",
-			annotations: map[string]string{annLinodeLoadBalancerPreserve: "bogus"},
+			annotations: map[string]string{annotations.AnnLinodeLoadBalancerPreserve: "bogus"},
 			deleted:     true,
 		},
 	} {
@@ -2273,13 +3161,13 @@ func testEnsureLoadBalancerPreserveAnnotation(t *testing.T, client *linodego.Cli
 				Spec: testServiceSpec,
 			}
 
-			nb, err := lb.createNodeBalancer(context.TODO(), "linodelb", svc, []*linodego.NodeBalancerConfigCreateOptions{})
+			nb, err := lb.createNodeBalancer(t.Context(), "linodelb", svc, []*linodego.NodeBalancerConfigCreateOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
 
 			svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nb)
-			err = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+			err = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 
 			didDelete := fake.didRequestOccur(http.MethodDelete, fmt.Sprintf("/nodebalancers/%d", nb.ID), "")
 			if didDelete && !test.deleted {
@@ -2296,12 +3184,14 @@ func testEnsureLoadBalancerPreserveAnnotation(t *testing.T, client *linodego.Cli
 }
 
 func testEnsureLoadBalancerDeleted(t *testing.T, client *linodego.Client, fake *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test",
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeDefaultProtocol: "tcp",
+				annotations.AnnLinodeDefaultProtocol: "tcp",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -2335,7 +3225,7 @@ func testEnsureLoadBalancerDeleted(t *testing.T, client *linodego.Client, fake *
 					Name: "notexists",
 					UID:  "notexists123",
 					Annotations: map[string]string{
-						annLinodeDefaultProtocol: "tcp",
+						annotations.AnnLinodeDefaultProtocol: "tcp",
 					},
 				},
 				Spec: v1.ServiceSpec{
@@ -2353,17 +3243,20 @@ func testEnsureLoadBalancerDeleted(t *testing.T, client *linodego.Client, fake *
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	configs := []*linodego.NodeBalancerConfigCreateOptions{}
-	_, err := lb.createNodeBalancer(context.TODO(), "linodelb", svc, configs)
+	_, err := lb.createNodeBalancer(t.Context(), "linodelb", svc, configs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc) }()
+	defer func() { _ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc) }()
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			err := lb.EnsureLoadBalancerDeleted(context.TODO(), test.clusterName, test.service)
+			err := lb.EnsureLoadBalancerDeleted(t.Context(), test.clusterName, test.service)
 			if !reflect.DeepEqual(err, test.err) {
 				t.Error("unexpected error")
 				t.Logf("expected: %v", test.err)
@@ -2374,13 +3267,15 @@ func testEnsureLoadBalancerDeleted(t *testing.T, client *linodego.Client, fake *
 }
 
 func testEnsureExistingLoadBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "testensure",
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeDefaultProtocol:           "tcp",
-				annLinodePortConfigPrefix + "8443": `{ "protocol": "https", "tls-secret-name": "tls-secret"}`,
+				annotations.AnnLinodeDefaultProtocol:           "tcp",
+				annotations.AnnLinodePortConfigPrefix + "8443": `{ "protocol": "https", "tls-secret-name": "tls-secret"}`,
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -2401,19 +3296,22 @@ func testEnsureExistingLoadBalancer(t *testing.T, client *linodego.Client, _ *fa
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	lb.kubeClient = fake.NewSimpleClientset()
 	addTLSSecret(t, lb.kubeClient)
 
 	configs := []*linodego.NodeBalancerConfigCreateOptions{}
-	nb, err := lb.createNodeBalancer(context.TODO(), "linodelb", svc, configs)
+	nb, err := lb.createNodeBalancer(t.Context(), "linodelb", svc, configs)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nb)
-	defer func() { _ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc) }()
-	getLBStatus, exists, err := lb.GetLoadBalancer(context.TODO(), "linodelb", svc)
+	defer func() { _ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc) }()
+	getLBStatus, exists, err := lb.GetLoadBalancer(t.Context(), "linodelb", svc)
 	if err != nil {
 		t.Fatalf("failed to create nodebalancer: %s", err)
 	}
@@ -2481,7 +3379,7 @@ func testEnsureExistingLoadBalancer(t *testing.T, client *linodego.Client, _ *fa
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			lbStatus, err := lb.EnsureLoadBalancer(context.TODO(), test.clusterName, test.service, test.nodes)
+			lbStatus, err := lb.EnsureLoadBalancer(t.Context(), test.clusterName, test.service, test.nodes)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2500,6 +3398,8 @@ func testEnsureExistingLoadBalancer(t *testing.T, client *linodego.Client, _ *fa
 }
 
 func testMakeLoadBalancerStatus(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	ipv4 := "192.168.0.1"
 	hostname := "nb-192-168-0-1.newark.nodebalancer.linode.com"
 	nb := &linodego.NodeBalancer{
@@ -2525,15 +3425,84 @@ func testMakeLoadBalancerStatus(t *testing.T, client *linodego.Client, _ *fakeAP
 		t.Errorf("expected status for basic service to be %#v; got %#v", expectedStatus, status)
 	}
 
-	svc.Annotations[annLinodeHostnameOnlyIngress] = "true"
+	svc.Annotations[annotations.AnnLinodeHostnameOnlyIngress] = "true"
 	expectedStatus.Ingress[0] = v1.LoadBalancerIngress{Hostname: hostname}
 	status = makeLoadBalancerStatus(svc, nb)
 	if !reflect.DeepEqual(status, expectedStatus) {
-		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annLinodeHostnameOnlyIngress, expectedStatus, status)
+		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annotations.AnnLinodeHostnameOnlyIngress, expectedStatus, status)
 	}
 }
 
+func testMakeLoadBalancerStatusWithIPv6(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
+	ipv4 := "192.168.0.1"
+	ipv6 := "2600:3c00::f03c:91ff:fe24:3a2f"
+	hostname := "nb-192-168-0-1.newark.nodebalancer.linode.com"
+	nb := &linodego.NodeBalancer{
+		IPv4:     &ipv4,
+		IPv6:     &ipv6,
+		Hostname: &hostname,
+	}
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "test",
+			Annotations: make(map[string]string, 1),
+		},
+	}
+
+	// Test with EnableIPv6ForLoadBalancers = false (default)
+	Options.EnableIPv6ForLoadBalancers = false
+	expectedStatus := &v1.LoadBalancerStatus{
+		Ingress: []v1.LoadBalancerIngress{{
+			Hostname: hostname,
+			IP:       ipv4,
+		}},
+	}
+	status := makeLoadBalancerStatus(svc, nb)
+	if !reflect.DeepEqual(status, expectedStatus) {
+		t.Errorf("expected status with EnableIPv6ForLoadBalancers=false to be %#v; got %#v", expectedStatus, status)
+	}
+
+	// Test with EnableIPv6ForLoadBalancers = true
+	Options.EnableIPv6ForLoadBalancers = true
+	expectedStatus = &v1.LoadBalancerStatus{
+		Ingress: []v1.LoadBalancerIngress{
+			{
+				Hostname: hostname,
+				IP:       ipv4,
+			},
+			{
+				Hostname: hostname,
+				IP:       ipv6,
+			},
+		},
+	}
+	status = makeLoadBalancerStatus(svc, nb)
+	if !reflect.DeepEqual(status, expectedStatus) {
+		t.Errorf("expected status with EnableIPv6ForLoadBalancers=true to be %#v; got %#v", expectedStatus, status)
+	}
+
+	// Test with per-service annotation
+	// Reset the global flag to false and set the annotation
+	Options.EnableIPv6ForLoadBalancers = false
+	svc.Annotations[annotations.AnnLinodeEnableIPv6Ingress] = "true"
+
+	// Expect the same result as when the global flag is enabled
+	status = makeLoadBalancerStatus(svc, nb)
+	if !reflect.DeepEqual(status, expectedStatus) {
+		t.Errorf("expected status with %s=true annotation to be %#v; got %#v",
+			annotations.AnnLinodeEnableIPv6Ingress, expectedStatus, status)
+	}
+
+	// Reset the flag to its default value
+	Options.EnableIPv6ForLoadBalancers = false
+}
+
 func testMakeLoadBalancerStatusEnvVar(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	ipv4 := "192.168.0.1"
 	hostname := "nb-192-168-0-1.newark.nodebalancer.linode.com"
 	nb := &linodego.NodeBalancer{
@@ -2563,32 +3532,34 @@ func testMakeLoadBalancerStatusEnvVar(t *testing.T, client *linodego.Client, _ *
 	expectedStatus.Ingress[0] = v1.LoadBalancerIngress{Hostname: hostname}
 	status = makeLoadBalancerStatus(svc, nb)
 	if !reflect.DeepEqual(status, expectedStatus) {
-		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annLinodeHostnameOnlyIngress, expectedStatus, status)
+		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annotations.AnnLinodeHostnameOnlyIngress, expectedStatus, status)
 	}
 
 	t.Setenv("LINODE_HOSTNAME_ONLY_INGRESS", "false")
 	expectedStatus.Ingress[0] = v1.LoadBalancerIngress{Hostname: hostname}
 	status = makeLoadBalancerStatus(svc, nb)
 	if reflect.DeepEqual(status, expectedStatus) {
-		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annLinodeHostnameOnlyIngress, expectedStatus, status)
+		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annotations.AnnLinodeHostnameOnlyIngress, expectedStatus, status)
 	}
 
 	t.Setenv("LINODE_HOSTNAME_ONLY_INGRESS", "banana")
 	expectedStatus.Ingress[0] = v1.LoadBalancerIngress{Hostname: hostname}
 	status = makeLoadBalancerStatus(svc, nb)
 	if reflect.DeepEqual(status, expectedStatus) {
-		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annLinodeHostnameOnlyIngress, expectedStatus, status)
+		t.Errorf("expected status for %q annotated service to be %#v; got %#v", annotations.AnnLinodeHostnameOnlyIngress, expectedStatus, status)
 	}
 	os.Unsetenv("LINODE_HOSTNAME_ONLY_INGRESS")
 }
 
 func testCleanupDoesntCall(t *testing.T, client *linodego.Client, fakeAPI *fakeAPI) {
+	t.Helper()
+
 	region := "us-west"
-	nb1, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{Region: region})
+	nb1, err := client.CreateNodeBalancer(t.Context(), linodego.NodeBalancerCreateOptions{Region: region})
 	if err != nil {
 		t.Fatal(err)
 	}
-	nb2, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{Region: region})
+	nb2, err := client.CreateNodeBalancer(t.Context(), linodego.NodeBalancerCreateOptions{Region: region})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2597,16 +3568,19 @@ func testCleanupDoesntCall(t *testing.T, client *linodego.Client, fakeAPI *fakeA
 	svcAnn := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        "test",
-			Annotations: map[string]string{annLinodeNodeBalancerID: strconv.Itoa(nb2.ID)},
+			Annotations: map[string]string{annotations.AnnLinodeNodeBalancerID: strconv.Itoa(nb2.ID)},
 		},
 	}
 	svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nb1)
 	svcAnn.Status.LoadBalancer = *makeLoadBalancerStatus(svcAnn, nb1)
-	lb := &loadbalancers{client, region, nil}
+	lb, assertion := newLoadbalancers(client, region).(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 
 	fakeAPI.ResetRequests()
 	t.Run("non-annotated service shouldn't call the API during cleanup", func(t *testing.T) {
-		if err := lb.cleanupOldNodeBalancer(context.TODO(), svc); err != nil {
+		if err := lb.cleanupOldNodeBalancer(t.Context(), svc); err != nil {
 			t.Fatal(err)
 		}
 		if len(fakeAPI.requests) != 0 {
@@ -2616,7 +3590,7 @@ func testCleanupDoesntCall(t *testing.T, client *linodego.Client, fakeAPI *fakeA
 
 	fakeAPI.ResetRequests()
 	t.Run("annotated service calls the API to load said NB", func(t *testing.T) {
-		if err := lb.cleanupOldNodeBalancer(context.TODO(), svcAnn); err != nil {
+		if err := lb.cleanupOldNodeBalancer(t.Context(), svcAnn); err != nil {
 			t.Fatal(err)
 		}
 		expectedRequests := map[fakeRequest]struct{}{
@@ -2631,6 +3605,8 @@ func testCleanupDoesntCall(t *testing.T, client *linodego.Client, fakeAPI *fakeA
 }
 
 func testUpdateLoadBalancerNoNodes(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        randString(),
@@ -2649,15 +3625,18 @@ func testUpdateLoadBalancerNoNodes(t *testing.T, client *linodego.Client, _ *fak
 		},
 	}
 
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	defer func() {
-		_ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc)
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
 	}()
 
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
-	nodeBalancer, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{
+	nodeBalancer, err := client.CreateNodeBalancer(t.Context(), linodego.NodeBalancerCreateOptions{
 		Region: lb.zone,
 	})
 	if err != nil {
@@ -2666,23 +3645,28 @@ func testUpdateLoadBalancerNoNodes(t *testing.T, client *linodego.Client, _ *fak
 	svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nodeBalancer)
 	stubService(fakeClientset, svc)
 	svc.ObjectMeta.SetAnnotations(map[string]string{
-		annLinodeNodeBalancerID: strconv.Itoa(nodeBalancer.ID),
+		annotations.AnnLinodeNodeBalancerID: strconv.Itoa(nodeBalancer.ID),
 	})
 
 	// setup done, test ensure/update
 	nodes := []*v1.Node{}
 
-	if _, err = lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes); !stderrors.Is(err, errNoNodesAvailable) {
+	if _, err = lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes); !stderrors.Is(err, errNoNodesAvailable) {
 		t.Errorf("EnsureLoadBalancer should return %v, got %v", errNoNodesAvailable, err)
 	}
 
-	if err := lb.UpdateLoadBalancer(context.TODO(), "linodelb", svc, nodes); !stderrors.Is(err, errNoNodesAvailable) {
+	if err := lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes); !stderrors.Is(err, errNoNodesAvailable) {
 		t.Errorf("UpdateLoadBalancer should return %v, got %v", errNoNodesAvailable, err)
 	}
 }
 
 func testGetNodeBalancerForServiceIDDoesNotExist(t *testing.T, client *linodego.Client, _ *fakeAPI) {
-	lb := &loadbalancers{client, "us-west", nil}
+	t.Helper()
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	bogusNodeBalancerID := "123456"
 
 	svc := &v1.Service{
@@ -2690,7 +3674,7 @@ func testGetNodeBalancerForServiceIDDoesNotExist(t *testing.T, client *linodego.
 			Name: "test",
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeNodeBalancerID: bogusNodeBalancerID,
+				annotations.AnnLinodeNodeBalancerID: bogusNodeBalancerID,
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -2705,7 +3689,7 @@ func testGetNodeBalancerForServiceIDDoesNotExist(t *testing.T, client *linodego.
 		},
 	}
 
-	_, err := lb.getNodeBalancerForService(context.TODO(), svc)
+	_, err := lb.getNodeBalancerForService(t.Context(), svc)
 	if err == nil {
 		t.Fatal("expected getNodeBalancerForService to return an error")
 	}
@@ -2721,8 +3705,13 @@ func testGetNodeBalancerForServiceIDDoesNotExist(t *testing.T, client *linodego.
 }
 
 func testEnsureNewLoadBalancerWithNodeBalancerID(t *testing.T, client *linodego.Client, _ *fakeAPI) {
-	lb := &loadbalancers{client, "us-west", nil}
-	nodeBalancer, err := client.CreateNodeBalancer(context.TODO(), linodego.NodeBalancerCreateOptions{
+	t.Helper()
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	nodeBalancer, err := client.CreateNodeBalancer(t.Context(), linodego.NodeBalancerCreateOptions{
 		Region: lb.zone,
 	})
 	if err != nil {
@@ -2734,7 +3723,7 @@ func testEnsureNewLoadBalancerWithNodeBalancerID(t *testing.T, client *linodego.
 			Name: "testensure",
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeNodeBalancerID: strconv.Itoa(nodeBalancer.ID),
+				annotations.AnnLinodeNodeBalancerID: strconv.Itoa(nodeBalancer.ID),
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -2765,21 +3754,23 @@ func testEnsureNewLoadBalancerWithNodeBalancerID(t *testing.T, client *linodego.
 		},
 	}
 
-	defer func() { _ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc) }()
+	defer func() { _ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc) }()
 
-	if _, err = lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes); err != nil {
+	if _, err = lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func testEnsureNewLoadBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "testensure",
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeDefaultProtocol:           "tcp",
-				annLinodePortConfigPrefix + "8443": `{ "protocol": "https", "tls-secret-name": "tls-secret"}`,
+				annotations.AnnLinodeDefaultProtocol:           "tcp",
+				annotations.AnnLinodePortConfigPrefix + "8443": `{ "protocol": "https", "tls-secret-name": "tls-secret"}`,
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -2815,26 +3806,34 @@ func testEnsureNewLoadBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI
 			},
 		},
 	}
-	lb := &loadbalancers{client, "us-west", nil}
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	lb.kubeClient = fake.NewSimpleClientset()
 	addTLSSecret(t, lb.kubeClient)
 
-	defer func() { _ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc) }()
+	defer func() { _ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc) }()
 
-	_, err := lb.EnsureLoadBalancer(context.TODO(), "linodelb", svc, nodes)
+	_, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
 func testGetLoadBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI) {
-	lb := &loadbalancers{client, "us-west", nil}
+	t.Helper()
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test",
 			UID:  "foobar123",
 			Annotations: map[string]string{
-				annLinodeDefaultProtocol: "tcp",
+				annotations.AnnLinodeDefaultProtocol: "tcp",
 			},
 		},
 		Spec: v1.ServiceSpec{
@@ -2850,11 +3849,11 @@ func testGetLoadBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI) {
 	}
 
 	configs := []*linodego.NodeBalancerConfigCreateOptions{}
-	nb, err := lb.createNodeBalancer(context.TODO(), "linodelb", svc, configs)
+	nb, err := lb.createNodeBalancer(t.Context(), "linodelb", svc, configs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = lb.EnsureLoadBalancerDeleted(context.TODO(), "linodelb", svc) }()
+	defer func() { _ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc) }()
 
 	lbStatus := makeLoadBalancerStatus(svc, nb)
 	svc.Status.LoadBalancer = *lbStatus
@@ -2881,7 +3880,7 @@ func testGetLoadBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI) {
 					Name: "notexists",
 					UID:  "notexists123",
 					Annotations: map[string]string{
-						annLinodeDefaultProtocol: "tcp",
+						annotations.AnnLinodeDefaultProtocol: "tcp",
 					},
 				},
 				Spec: v1.ServiceSpec{
@@ -2903,7 +3902,7 @@ func testGetLoadBalancer(t *testing.T, client *linodego.Client, _ *fakeAPI) {
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			_, found, err := lb.GetLoadBalancer(context.TODO(), test.clusterName, test.service)
+			_, found, err := lb.GetLoadBalancer(t.Context(), test.clusterName, test.service)
 			if found != test.found {
 				t.Error("unexpected error")
 				t.Logf("expected: %v", test.found)
@@ -2943,7 +3942,7 @@ func Test_getPortConfigAnnotation(t *testing.T) {
 	}{
 		{
 			name: "Test single port annotation",
-			ann:  map[string]string{annLinodePortConfigPrefix + "443": `{ "tls-secret-name": "prod-app-tls", "protocol": "https" }`},
+			ann:  map[string]string{annotations.AnnLinodePortConfigPrefix + "443": `{ "tls-secret-name": "prod-app-tls", "protocol": "https" }`},
 			expected: portConfigAnnotation{
 				TLSSecretName: "prod-app-tls",
 				Protocol:      "https",
@@ -2953,8 +3952,8 @@ func Test_getPortConfigAnnotation(t *testing.T) {
 		{
 			name: "Test multiple port annotation",
 			ann: map[string]string{
-				annLinodePortConfigPrefix + "443": `{ "tls-secret-name": "prod-app-tls", "protocol": "https" }`,
-				annLinodePortConfigPrefix + "80":  `{ "protocol": "http" }`,
+				annotations.AnnLinodePortConfigPrefix + "443": `{ "tls-secret-name": "prod-app-tls", "protocol": "https" }`,
+				annotations.AnnLinodePortConfigPrefix + "80":  `{ "protocol": "http" }`,
 			},
 			expected: portConfigAnnotation{
 				TLSSecretName: "prod-app-tls",
@@ -2973,7 +3972,7 @@ func Test_getPortConfigAnnotation(t *testing.T) {
 		{
 			name: "Test invalid json",
 			ann: map[string]string{
-				annLinodePortConfigPrefix + "443": `{ "tls-secret-name": "prod-app-tls" `,
+				annotations.AnnLinodePortConfigPrefix + "443": `{ "tls-secret-name": "prod-app-tls" `,
 			},
 			expected: portConfigAnnotation{},
 			err:      "unexpected end of JSON input",
@@ -3054,7 +4053,7 @@ func Test_getTLSCertInfo(t *testing.T) {
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			cert, key, err := getTLSCertInfo(context.TODO(), kubeClient, "", test.portConfig)
+			cert, key, err := getTLSCertInfo(t.Context(), kubeClient, "", test.portConfig)
 			if cert != test.cert {
 				t.Error("unexpected error")
 				t.Logf("expected: %v", test.cert)
@@ -3075,7 +4074,9 @@ func Test_getTLSCertInfo(t *testing.T) {
 }
 
 func addTLSSecret(t *testing.T, kubeClient kubernetes.Interface) {
-	_, err := kubeClient.CoreV1().Secrets("").Create(context.TODO(), &v1.Secret{
+	t.Helper()
+
+	_, err := kubeClient.CoreV1().Secrets("").Create(t.Context(), &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "tls-secret",
 		},
@@ -3129,5 +4130,139 @@ func Test_LoadbalNodeNameCoercion(t *testing.T) {
 		if out := coerceString(tc.nodeName, 3, 32, tc.padding); out != tc.expectedOutput {
 			t.Fatalf("Expected loadbal backend name to be %s (got: %s)", tc.expectedOutput, out)
 		}
+	}
+}
+
+func Test_loadbalancers_GetLinodeNBType(t *testing.T) {
+	type fields struct {
+		client           client.Client
+		zone             string
+		kubeClient       kubernetes.Interface
+		ciliumClient     ciliumclient.CiliumV2alpha1Interface
+		loadBalancerType string
+	}
+	type args struct {
+		service *v1.Service
+	}
+	tests := []struct {
+		name      string
+		fields    fields
+		args      args
+		defaultNB linodego.NodeBalancerPlanType
+		want      linodego.NodeBalancerPlanType
+	}{
+		{
+			name: "No annotation in service and common as default",
+			fields: fields{
+				client:           nil,
+				zone:             "",
+				kubeClient:       nil,
+				ciliumClient:     nil,
+				loadBalancerType: "nodebalancer",
+			},
+			args: args{
+				service: &v1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test",
+						Annotations: map[string]string{},
+					},
+				},
+			},
+			defaultNB: linodego.NBTypeCommon,
+			want:      linodego.NBTypeCommon,
+		},
+		{
+			name: "No annotation in service and premium as default",
+			fields: fields{
+				client:           nil,
+				zone:             "",
+				kubeClient:       nil,
+				ciliumClient:     nil,
+				loadBalancerType: "nodebalancer",
+			},
+			args: args{
+				service: &v1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:        "test",
+						Annotations: map[string]string{},
+					},
+				},
+			},
+			defaultNB: linodego.NBTypePremium,
+			want:      linodego.NBTypePremium,
+		},
+		{
+			name: "Nodebalancer type annotation in service",
+			fields: fields{
+				client:           nil,
+				zone:             "",
+				kubeClient:       nil,
+				ciliumClient:     nil,
+				loadBalancerType: "nodebalancer",
+			},
+			args: args{
+				service: &v1.Service{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "test",
+						Annotations: map[string]string{
+							annotations.AnnLinodeNodeBalancerType: string(linodego.NBTypePremium),
+						},
+					},
+				},
+			},
+			defaultNB: linodego.NBTypeCommon,
+			want:      linodego.NBTypePremium,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l := &loadbalancers{
+				client:           tt.fields.client,
+				zone:             tt.fields.zone,
+				kubeClient:       tt.fields.kubeClient,
+				ciliumClient:     tt.fields.ciliumClient,
+				loadBalancerType: tt.fields.loadBalancerType,
+			}
+			Options.DefaultNBType = string(tt.defaultNB)
+			if got := l.GetLinodeNBType(tt.args.service); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("loadbalancers.GetLinodeNBType() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_validateNodeBalancerBackendIPv4Range(t *testing.T) {
+	type args struct {
+		backendIPv4Range string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			name:    "Valid IPv4 range",
+			args:    args{backendIPv4Range: "10.100.0.0/30"},
+			wantErr: false,
+		},
+		{
+			name:    "Invalid IPv4 range",
+			args:    args{backendIPv4Range: "10.100.0.0"},
+			wantErr: true,
+		},
+	}
+
+	nbBackendSubnet := Options.NodeBalancerBackendIPv4Subnet
+	defer func() {
+		Options.NodeBalancerBackendIPv4Subnet = nbBackendSubnet
+	}()
+	Options.NodeBalancerBackendIPv4Subnet = "10.100.0.0/24"
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validateNodeBalancerBackendIPv4Range(tt.args.backendIPv4Range); (err != nil) != tt.wantErr {
+				t.Errorf("validateNodeBalancerBackendIPv4Range() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }

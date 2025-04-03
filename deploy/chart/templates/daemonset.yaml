@@ -9,33 +9,157 @@ spec:
   selector:
     matchLabels:
       app: ccm-linode
+  {{- with .Values.updateStrategy }}
+  updateStrategy: 
+  {{- toYaml . | nindent 4 }}
+  {{- end }}
   template:
     metadata:
       labels:
         app: ccm-linode
     spec:
+      {{- if ne .Values.rbacEnabled false }}
       serviceAccountName: ccm-linode
-      {{- if .Values.nodeSelector }}
+      {{- end }}
+      {{- with .Values.securityContext }}
+      securityContext:
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
       nodeSelector:
-{{ toYaml .Values.nodeSelector | indent 8 }}
+      {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if .Values.tolerations }}
+      {{- with .Values.affinity }}
+      affinity:
+      {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
       tolerations:
-{{ toYaml .Values.tolerations | indent 8 }}
+      {{- toYaml . | nindent 8 }}
       {{- end }}
-      hostNetwork: true
+      hostNetwork: {{ if hasKey .Values "enableHostNetwork" }}{{ .Values.enableHostNetwork }}{{ else }}true{{ end }}
       containers:
         - image: {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           name: ccm-linode
           args:
-            - --leader-elect-resource-lock=endpoints
-            - --v=3
-            - --port=0
+            - --leader-elect-resource-lock=leases
+            - --v={{ default 3 .Values.logVerbosity }}
             - --secure-port=10253
+            - --webhook-secure-port=0
+            {{- with .Values.linodegoDebug }}
+            - --linodego-debug={{ . }}
+            {{- end }}
+            {{- $clusterCIDR := .Values.clusterCIDR }}
+            {{- if and .Values.routeController .Values.routeController.clusterCIDR }}
+            {{- $clusterCIDR = .Values.routeController.clusterCIDR }}
+            {{- end }}
+            {{- if .Values.enableNodeIPAM }}
+            {{- with .Values.enableNodeIPAM }}
+            - --allocate-node-cidrs={{ . }}
+            {{- end }}
+            {{- if not $clusterCIDR }}
+            {{- fail "clusterCIDR is required if enableNodeIPAM is set" }}
+            {{- end }}
+            {{- with .Values.nodeCIDRMaskSizeIPv4 }}
+            - --node-cidr-mask-size-ipv4={{ . }}
+            {{- end }}
+            {{- with .Values.nodeCIDRMaskSizeIPv6 }}
+            - --node-cidr-mask-size-ipv6={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- $vpcNames := .Values.vpcNames }}
+            {{- if and .Values.routeController .Values.routeController.vpcNames }}
+            {{- $vpcNames = .Values.routeController.vpcNames }}
+            {{- end }}
+            {{- $vpcName := .Values.vpcName }}
+            {{- if and .Values.routeController .Values.routeController.vpcName }}
+            {{- $vpcName = .Values.routeController.vpcName }}
+            {{- end }}
+            {{- if and $vpcName $vpcNames }}
+            {{- fail "Both vpcName and vpcNames are set. Please use only vpcNames." }}
+            {{- end }}
+            {{- $subnetNames := .Values.subnetNames }}
+            {{- if and .Values.routeController .Values.routeController.subnetNames }}
+            {{- $subnetNames = .Values.routeController.subnetNames }}
+            {{- end }}
+            {{- if .Values.routeController }}
+            - --enable-route-controller=true
+            {{- if not (or $vpcName $vpcNames) }}
+            {{- fail "Neither vpcName nor vpcNames is set. Please set one of them." }}
+            {{- end }}
+            {{- if not $clusterCIDR }}
+            {{- fail "clusterCIDR is required if route-controller is enabled" }}
+            {{- end }}
+            - --configure-cloud-routes={{ default true .Values.routeController.configureCloudRoutes }}
+            {{- with .Values.routeController.routeReconciliationPeriod }}
+            - --route-reconciliation-period={{ . }}
+            {{- end }}
+            {{- end }}
+            {{- with $vpcNames }}
+            - --vpc-names={{ . }}
+            {{- end }}
+            {{- with $vpcName }}
+            - --vpc-name={{ . }}
+            {{- end }}
+            {{- with $subnetNames }}
+            - --subnet-names={{ . }}
+            {{- end }}
+            {{- with $clusterCIDR }}
+            - --cluster-cidr={{ . }}
+            {{- end }}
+            {{- if .Values.sharedIPLoadBalancing }}
+            {{- with .Values.sharedIPLoadBalancing.bgpNodeSelector }}
+            - --bgp-node-selector={{ . }}
+            {{- end }}
+            {{- with .Values.sharedIPLoadBalancing.ipHolderSuffix }}
+            - --ip-holder-suffix={{ . }}
+            {{- end}}
+            - --load-balancer-type={{ required "A valid .Values.sharedIPLoadBalancing.loadBalancerType is required for shared IP load-balancing" .Values.sharedIPLoadBalancing.loadBalancerType }}
+            {{- end }}
+            {{- with .Values.tokenHealthChecker }}
+            - --enable-token-health-checker={{ . }}
+            {{- end }}
+            {{- with .Values.nodeBalancerTags }}
+            - --nodebalancer-tags={{ join " " . }}
+            {{- end }}
+            {{- if .Values.allowUnauthorizedMetrics }}
+            - --authorization-always-allow-paths="/metrics"
+            {{- end }}
+            {{- if .Values.defaultNBType }}
+            - --default-nodebalancer-type={{ .Values.defaultNBType }}
+            {{- end }}
+            {{- if .Values.enableIPv6ForLoadBalancers }}
+            - --enable-ipv6-for-loadbalancers={{ .Values.enableIPv6ForLoadBalancers }}
+            {{- end }}
+            {{- if .Values.nodeBalancerBackendIPv4Subnet }}
+            - --nodebalancer-backend-ipv4-subnet={{ .Values.nodeBalancerBackendIPv4Subnet }}
+            {{- end }}
+            {{- if .Values.extraArgs }}
+            {{- toYaml .Values.extraArgs | nindent 12 }}
+            {{- end }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+          {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe: 
+          {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe: 
+          {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources: 
+          {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - mountPath: /etc/kubernetes
               name: k8s
+            {{- with .Values.volumeMounts}}
+            {{- toYaml . | nindent 12 }}
+            {{- end}}
           env:
             - name: LINODE_API_TOKEN
               valueFrom:
@@ -47,10 +171,17 @@ spec:
                 secretKeyRef:
                   name: {{ if .Values.secretRef }}{{ .Values.secretRef.name | default "ccm-linode" }}{{ else }}"ccm-linode"{{ end }}
                   key: {{ if .Values.secretRef }}{{ .Values.secretRef.regionRef | default "region" }}{{ else }}"region"{{ end }}
-            {{if .Values.env}}
-            {{- toYaml .Values.env | nindent 12 }}
-            {{end}}
+            {{- with .Values.env}}
+            {{- toYaml . | nindent 12 }}
+            {{- end}}
       volumes:
+        {{- with .Values.k8sVolume }}
+        {{- toYaml . | nindent 8 }}
+        {{- else }}
         - name: k8s
           hostPath:
             path: /etc/kubernetes
+        {{- end }}
+        {{- with .Values.volumes}}
+        {{- toYaml . | nindent 8 }}
+        {{- end}}
