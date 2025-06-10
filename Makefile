@@ -27,9 +27,11 @@ WORKER_NODES            ?= 1
 LINODE_FIREWALL_ENABLED ?= true
 LINODE_REGION           ?= us-lax
 LINODE_OS               ?= linode/ubuntu22.04
+LINODE_URL              ?= https://api.linode.com
 KUBECONFIG_PATH         ?= $(CURDIR)/test-cluster-kubeconfig.yaml
 SUBNET_KUBECONFIG_PATH	?= $(CURDIR)/subnet-testing-kubeconfig.yaml
 MGMT_KUBECONFIG_PATH    ?= $(CURDIR)/mgmt-cluster-kubeconfig.yaml
+GOLANGCI_LINT_VERSION   ?= v2.1.5
 
 # if the $DEVBOX_PACKAGES_DIR env variable exists that means we are within a devbox shell and can safely
 # use devbox's bin for our tools
@@ -64,8 +66,7 @@ vet: fmt
 
 .PHONY: lint
 lint:
-	docker run --rm -v "$(PWD):/var/work:ro" -w /var/work \
-		golangci/golangci-lint:latest golangci-lint run -c .golangci.yml
+	docker run --rm -w /workdir -v $(PWD):/workdir golangci/golangci-lint:$(GOLANGCI_LINT_VERSION) golangci-lint run -c .golangci.yml --fix
 
 .PHONY: gosec
 gosec: ## Run gosec against code.
@@ -200,6 +201,7 @@ e2e-test:
 	KUBECONFIG=$(KUBECONFIG_PATH) \
 	REGION=$(LINODE_REGION) \
 	LINODE_TOKEN=$(LINODE_TOKEN) \
+	LINODE_URL=$(LINODE_URL) \
 	chainsaw test e2e/test --parallel 2 $(E2E_FLAGS)
 
 .PHONY: e2e-test-bgp
@@ -211,6 +213,7 @@ e2e-test-bgp:
 		KUBECONFIG=$(KUBECONFIG_PATH) \
 		REGION=$(LINODE_REGION) \
 		LINODE_TOKEN=$(LINODE_TOKEN) \
+		LINODE_URL=$(LINODE_URL) \
 		chainsaw test e2e/bgp-test/lb-cilium-bgp $(E2E_FLAGS)
 
 .PHONY: e2e-test-subnet
@@ -230,6 +233,7 @@ e2e-test-subnet:
 	KUBECONFIG_PATH=$(SUBNET_KUBECONFIG_PATH) make patch-linode-ccm
 	# Run chainsaw test
 	LINODE_TOKEN=$(LINODE_TOKEN) \
+		LINODE_URL=$(LINODE_URL) \
 		FIRST_CONFIG=$(KUBECONFIG_PATH) \
 		SECOND_CONFIG=$(SUBNET_KUBECONFIG_PATH) \
 		chainsaw test e2e/subnet-test $(E2E_FLAGS)

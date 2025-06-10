@@ -115,7 +115,10 @@ o/aoxqmE0mN1lyCPOa9UP//LlsREkWVKI3+Wld/xERtzf66hjcH+ilsXDxxpMEXo
 bSiPJQsGIKtQvyCaZY2szyOoeUGgOId+He7ITlezxKrjdj+1pLMESvAxKeo=
 -----END RSA PRIVATE KEY-----`
 
-const drop string = "DROP"
+const (
+	drop          string = "DROP"
+	defaultSubnet string = "default"
+)
 
 func TestCCMLoadBalancers(t *testing.T) {
 	testCases := []struct {
@@ -163,7 +166,23 @@ func TestCCMLoadBalancers(t *testing.T) {
 			f:    testUpdateNodeBalancerWithVPCBackend,
 		},
 		{
-			name: "Create Load Balancer With VPC Backend - Overwrite VPC Name and Subnet with Annotation",
+			name: "Create Load Balancer With VPC Backend - Just specify Subnet flag",
+			f:    testCreateNodeBalancerWithVPCOnlySubnetFlag,
+		},
+		{
+			name: "Create Load Balancer With VPC Backend - Just specify Subnet id",
+			f:    testCreateNodeBalancerWithVPCOnlySubnetIDFlag,
+		},
+		{
+			name: "Create Load Balancer With VPC Backend - No specific flags or annotations",
+			f:    testCreateNodeBalancerWithVPCNoFlagOrAnnotation,
+		},
+		{
+			name: "Create Load Balancer With VPC Backend - annotations for vpc and subnet",
+			f:    testCreateNodeBalancerWithVPCAnnotationOnly,
+		},
+		{
+			name: "Create Load Balancer With VPC Backend - Specify subnet ID",
 			f:    testCreateNodeBalancerWithVPCAnnotationOverwrite,
 		},
 		{
@@ -281,6 +300,10 @@ func TestCCMLoadBalancers(t *testing.T) {
 		{
 			name: "Create Load Balancer - Very long Service name",
 			f:    testVeryLongServiceName,
+		},
+		{
+			name: "getNodeBalancerByStatus with IPv4 and IPv6 addresses",
+			f:    testGetNodeBalancerByStatus,
 		},
 	}
 
@@ -523,17 +546,11 @@ func testCreateNodeBalancerWithGlobalTags(t *testing.T, client *linodego.Client,
 func testCreateNodeBalancerWithVPCBackend(t *testing.T, client *linodego.Client, f *fakeAPI) {
 	t.Helper()
 
-	// test when no VPCs are present
+	// provision vpc and test
 	ann := map[string]string{
 		annotations.NodeBalancerBackendIPv4Range: "10.100.0.0/30",
 	}
-	if err := testCreateNodeBalancer(t, client, f, ann, nil); err == nil {
-		t.Fatalf("expected nodebalancer creation to fail")
-	}
 
-	f.ResetRequests()
-
-	// provision vpc and test again
 	vpcNames := Options.VPCNames
 	subnetNames := Options.SubnetNames
 	defer func() {
@@ -541,14 +558,14 @@ func testCreateNodeBalancerWithVPCBackend(t *testing.T, client *linodego.Client,
 		Options.SubnetNames = subnetNames
 	}()
 	Options.VPCNames = "test1"
-	Options.SubnetNames = "default"
+	Options.SubnetNames = defaultSubnet
 	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
 		Label:       "test1",
 		Description: "",
 		Region:      "us-west",
 		Subnets: []linodego.VPCSubnetCreateOptions{
 			{
-				Label: "default",
+				Label: defaultSubnet,
 				IPv4:  "10.0.0.0/8",
 			},
 		},
@@ -583,14 +600,14 @@ func testUpdateNodeBalancerWithVPCBackend(t *testing.T, client *linodego.Client,
 		Options.SubnetNames = subnetNames
 	}()
 	Options.VPCNames = "test1"
-	Options.SubnetNames = "default"
+	Options.SubnetNames = defaultSubnet
 	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
 		Label:       "test1",
 		Description: "",
 		Region:      "us-west",
 		Subnets: []linodego.VPCSubnetCreateOptions{
 			{
-				Label: "default",
+				Label: defaultSubnet,
 				IPv4:  "10.0.0.0/8",
 			},
 		},
@@ -647,8 +664,362 @@ func testUpdateNodeBalancerWithVPCBackend(t *testing.T, client *linodego.Client,
 	svc.Status.LoadBalancer = *lbStatus
 
 	stubService(fakeClientset, svc)
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.NodeBalancerBackendIPv4Range: "10.100.1.0/30",
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error while updated annotations: %s", err)
+	}
+}
+
+func testCreateNodeBalancerWithVPCOnlySubnetFlag(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	// provision vpc and test
+	vpcNames := Options.VPCNames
+	subnetNames := Options.SubnetNames
+	nbBackendSubnet := Options.NodeBalancerBackendIPv4Subnet
+	defer func() {
+		Options.VPCNames = vpcNames
+		Options.SubnetNames = subnetNames
+		Options.NodeBalancerBackendIPv4Subnet = nbBackendSubnet
+	}()
+	Options.VPCNames = "test-subflag"
+	Options.SubnetNames = defaultSubnet
+	Options.NodeBalancerBackendIPv4Subnet = "10.254.0.0/24"
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test-subflag",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: defaultSubnet,
+				IPv4:  "10.0.0.0/8",
+			},
+		},
+	})
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        randString(),
+			UID:         "foobar123",
+			Annotations: map[string]string{},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "10.0.0.2",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+
+	stubService(fakeClientset, svc)
+	svc.SetAnnotations(map[string]string{
+		annotations.NodeBalancerBackendIPv4Range: "10.254.0.60/30",
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error with updated annotations: %s", err)
+	}
+
+	// test with IPv4Range outside of defined NodeBalancer subnet
+	svc.SetAnnotations(map[string]string{
+		annotations.NodeBalancerBackendIPv4Range: "10.100.0.0/30",
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err == nil {
+		t.Errorf("UpdateLoadBalancer should have returned an error when ipv4_range is outside of specified subnet: %s", err)
+	}
+}
+
+func testCreateNodeBalancerWithVPCNoFlagOrAnnotation(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	// provision vpc and test
+	vpcNames := Options.VPCNames
+	subnetNames := Options.SubnetNames
+	defer func() {
+		Options.VPCNames = vpcNames
+		Options.SubnetNames = subnetNames
+	}()
+	Options.VPCNames = "test-noflags"
+	Options.SubnetNames = defaultSubnet
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test-noflags",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: defaultSubnet,
+				IPv4:  "10.0.0.0/8",
+			},
+		},
+	})
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        randString(),
+			UID:         "foobar123",
+			Annotations: map[string]string{},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "10.10.10.2",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+
+	stubService(fakeClientset, svc)
+	svc.SetAnnotations(map[string]string{
+		annotations.NodeBalancerBackendIPv4Range: "10.254.0.60/30",
+	})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error with updated annotations: %s", err)
+	}
+}
+
+func testCreateNodeBalancerWithVPCAnnotationOnly(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	// provision vpc and test
+	vpcNames := Options.VPCNames
+	subnetNames := Options.SubnetNames
+	defer func() {
+		Options.VPCNames = vpcNames
+		Options.SubnetNames = subnetNames
+	}()
+	Options.VPCNames = "test-onlyannotation"
+	Options.SubnetNames = defaultSubnet
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test-onlyannotation",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: defaultSubnet,
+				IPv4:  "10.0.0.0/8",
+			},
+			{
+				Label: "custom",
+				IPv4:  "192.168.0.0/24",
+			},
+		},
+	})
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: randString(),
+			UID:  "foobar123",
+			Annotations: map[string]string{
+				annotations.NodeBalancerBackendSubnetName: "custom",
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "10.11.11.2",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+
+	stubService(fakeClientset, svc)
+	svc.SetAnnotations(map[string]string{})
+
+	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("UpdateLoadBalancer returned an error with updated annotations: %s", err)
+	}
+}
+
+func testCreateNodeBalancerWithVPCOnlySubnetIDFlag(t *testing.T, client *linodego.Client, f *fakeAPI) {
+	t.Helper()
+
+	// provision vpc and test
+	vpcNames := Options.VPCNames
+	subnetNames := Options.SubnetNames
+	nbBackendSubnetID := Options.NodeBalancerBackendIPv4SubnetID
+	defer func() {
+		Options.VPCNames = vpcNames
+		Options.SubnetNames = subnetNames
+		Options.NodeBalancerBackendIPv4SubnetID = nbBackendSubnetID
+	}()
+	Options.VPCNames = "test1"
+	Options.SubnetNames = defaultSubnet
+	Options.NodeBalancerBackendIPv4SubnetID = 1111
+	_, _ = client.CreateVPC(t.Context(), linodego.VPCCreateOptions{
+		Label:       "test-subid-flag",
+		Description: "",
+		Region:      "us-west",
+		Subnets: []linodego.VPCSubnetCreateOptions{
+			{
+				Label: defaultSubnet,
+				IPv4:  "10.0.0.0/8",
+			},
+		},
+	})
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        randString(),
+			UID:         "foobar123",
+			Annotations: map[string]string{},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name:     randString(),
+					Protocol: "TCP",
+					Port:     int32(80),
+					NodePort: int32(30000),
+				},
+			},
+		},
+	}
+
+	nodes := []*v1.Node{
+		{
+			Status: v1.NodeStatus{
+				Addresses: []v1.NodeAddress{
+					{
+						Type:    v1.NodeInternalIP,
+						Address: "10.0.0.3",
+					},
+				},
+			},
+		},
+	}
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	defer func() {
+		_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", svc)
+	}()
+
+	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
+	if err != nil {
+		t.Errorf("EnsureLoadBalancer returned an error: %s", err)
+	}
+	svc.Status.LoadBalancer = *lbStatus
+
+	stubService(fakeClientset, svc)
+
+	// test with annotation specifying subnet id
+	svc.SetAnnotations(map[string]string{
+		annotations.NodeBalancerBackendSubnetID: "2222",
 	})
 
 	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
@@ -676,7 +1047,7 @@ func testCreateNodeBalancerWithVPCAnnotationOverwrite(t *testing.T, client *lino
 		Region:      "us-west",
 		Subnets: []linodego.VPCSubnetCreateOptions{
 			{
-				Label: "default",
+				Label: defaultSubnet,
 				IPv4:  "10.0.0.0/8",
 			},
 		},
@@ -953,7 +1324,7 @@ func testUpdateLoadBalancerAddAnnotation(t *testing.T, client *linodego.Client, 
 	svc.Status.LoadBalancer = *lbStatus
 
 	stubService(fakeClientset, svc)
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeThrottle: "10",
 	})
 
@@ -1028,7 +1399,7 @@ func testUpdateLoadBalancerAddPortAnnotation(t *testing.T, client *linodego.Clie
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		portConfigAnnotation: `{"protocol": "http"}`,
 	})
 
@@ -1140,7 +1511,7 @@ func testVeryLongServiceName(t *testing.T, client *linodego.Client, _ *fakeAPI) 
 	svc.Status.LoadBalancer = *lbStatus
 	stubService(fakeClientset, svc)
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: `{
 			"denyList": {
 				"ipv4": ["192.168.1.0/32"],
@@ -1209,7 +1580,7 @@ func testUpdateLoadBalancerAddTags(t *testing.T, client *linodego.Client, _ *fak
 	stubService(fakeClientset, svc)
 
 	testTags := "test,new,tags"
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeLoadBalancerTags: testTags,
 	})
 
@@ -1295,7 +1666,7 @@ func testUpdateLoadBalancerAddTLSPort(t *testing.T, client *linodego.Client, _ *
 
 	stubService(fakeClientset, svc)
 	svc.Spec.Ports = append(svc.Spec.Ports, extraPort)
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodePortConfigPrefix + "443": `{ "protocol": "https", "tls-secret-name": "tls-secret"}`,
 	})
 	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
@@ -1414,7 +1785,7 @@ func testUpdateLoadBalancerAddProxyProtocol(t *testing.T, client *linodego.Clien
 			}
 
 			svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nodeBalancer)
-			svc.ObjectMeta.SetAnnotations(map[string]string{
+			svc.SetAnnotations(map[string]string{
 				annotations.AnnLinodeDefaultProxyProtocol: string(tc.proxyProtocolConfig),
 			})
 
@@ -1520,7 +1891,7 @@ func testUpdateLoadBalancerAddNewFirewall(t *testing.T, client *linodego.Client,
 		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
@@ -1648,7 +2019,7 @@ func testUpdateLoadBalancerAddNewFirewallACL(t *testing.T, client *linodego.Clie
 		t.Fatalf("unable to marshal json acl")
 	}
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: string(aclString),
 	})
 
@@ -1720,7 +2091,7 @@ func testUpdateLoadBalancerDeleteFirewallRemoveACL(t *testing.T, client *linodeg
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["2.2.2.2"]
@@ -1761,7 +2132,7 @@ func testUpdateLoadBalancerDeleteFirewallRemoveACL(t *testing.T, client *linodeg
 		t.Errorf("expected IP, got %v", fwIPs)
 	}
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{})
+	svc.SetAnnotations(map[string]string{})
 
 	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
@@ -1818,7 +2189,7 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 	fakeClientset := fake.NewSimpleClientset()
 	lb.kubeClient = fakeClientset
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["2.2.2.2"]
@@ -1880,7 +2251,7 @@ func testUpdateLoadBalancerUpdateFirewallRemoveACLaddID(t *testing.T, client *li
 		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
@@ -1978,7 +2349,7 @@ func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *li
 		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
@@ -2014,7 +2385,7 @@ func testUpdateLoadBalancerUpdateFirewallRemoveIDaddACL(t *testing.T, client *li
 	if fwIPs == nil {
 		t.Errorf("expected IP, got %v", fwIPs)
 	}
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["2.2.2.2"]
@@ -2136,7 +2507,7 @@ func testUpdateLoadBalancerUpdateFirewallACL(t *testing.T, client *linodego.Clie
 	}
 
 	// Add ipv6 ips in allowList
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["2.2.2.2/32", "3.3.3.3/32"],
@@ -2182,7 +2553,7 @@ func testUpdateLoadBalancerUpdateFirewallACL(t *testing.T, client *linodego.Clie
 	}
 
 	// Update ips in allowList
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["2.2.2.1/32", "3.3.3.3/32"],
@@ -2228,7 +2599,7 @@ func testUpdateLoadBalancerUpdateFirewallACL(t *testing.T, client *linodego.Clie
 	}
 
 	// remove one ipv4 and one ipv6 ip from allowList
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallACL: `{
 			"allowList": {
 				"ipv4": ["3.3.3.3/32"],
@@ -2350,7 +2721,7 @@ func testUpdateLoadBalancerUpdateFirewall(t *testing.T, client *linodego.Client,
 		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 	lbStatus, err := lb.EnsureLoadBalancer(t.Context(), "linodelb", svc, nodes)
@@ -2387,7 +2758,7 @@ func testUpdateLoadBalancerUpdateFirewall(t *testing.T, client *linodego.Client,
 		_ = fwClient.DeleteFirewall(t.Context(), firewallNew)
 	}()
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(firewallNew.ID),
 	})
 
@@ -2482,7 +2853,7 @@ func testUpdateLoadBalancerDeleteFirewallRemoveID(t *testing.T, client *linodego
 		_ = fwClient.DeleteFirewall(t.Context(), fw)
 	}()
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeCloudFirewallID: strconv.Itoa(fw.ID),
 	})
 
@@ -2511,7 +2882,7 @@ func testUpdateLoadBalancerDeleteFirewallRemoveID(t *testing.T, client *linodego
 		t.Fatalf("Attached firewallID not matching with created firewall")
 	}
 
-	svc.ObjectMeta.SetAnnotations(map[string]string{})
+	svc.SetAnnotations(map[string]string{})
 
 	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
 	if err != nil {
@@ -2590,7 +2961,7 @@ func testUpdateLoadBalancerAddNodeBalancerID(t *testing.T, client *linodego.Clie
 	}
 
 	stubService(fakeClientset, svc)
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeNodeBalancerID: strconv.Itoa(newNodeBalancer.ID),
 	})
 	err = lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes)
@@ -2700,6 +3071,7 @@ func Test_getPortConfig(t *testing.T) {
 	testcases := []struct {
 		name               string
 		service            *v1.Service
+		port               v1.ServicePort
 		expectedPortConfig portConfig
 		err                error
 	}{
@@ -2711,7 +3083,17 @@ func Test_getPortConfig(t *testing.T) {
 					UID:  "abc123",
 				},
 			},
-			portConfig{Port: 443, Protocol: "tcp", ProxyProtocol: linodego.ProxyProtocolNone},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
 			nil,
 		},
 		{
@@ -2725,7 +3107,17 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{Port: 443, Protocol: "tcp", ProxyProtocol: linodego.ProxyProtocolV2},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolV2,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
 			nil,
 		},
 		{
@@ -2740,7 +3132,17 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{Port: 443, Protocol: "tcp", ProxyProtocol: linodego.ProxyProtocolV1},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolV1,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
 			nil,
 		},
 		{
@@ -2754,7 +3156,15 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:     443,
+				Protocol: "tcp",
+			},
 			fmt.Errorf("invalid NodeBalancer proxy protocol value '%s'", "invalid"),
 		},
 		{
@@ -2765,8 +3175,17 @@ func Test_getPortConfig(t *testing.T) {
 					UID:  "abc123",
 				},
 			},
-			portConfig{Port: 443, Protocol: "tcp", ProxyProtocol: linodego.ProxyProtocolNone},
-
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     int32(443),
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
 			nil,
 		},
 		{
@@ -2780,8 +3199,345 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{Port: 443, Protocol: "tcp", ProxyProtocol: linodego.ProxyProtocolNone},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
 			nil,
+		},
+		{
+			"different algorithm specified for tcp protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:  "tcp",
+						annotations.AnnLinodeDefaultAlgorithm: string(linodego.AlgorithmSource),
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmSource,
+			},
+			nil,
+		},
+		{
+			"algorithm ring_hash is not allowed for tcp protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:  "tcp",
+						annotations.AnnLinodeDefaultAlgorithm: string(linodego.AlgorithmRingHash),
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+			},
+			fmt.Errorf("invalid algorithm: %q specified for TCP/HTTP/HTTPS protocol", string(linodego.AlgorithmRingHash)),
+		},
+		{
+			"default udp protocol specified",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol: "udp",
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:          2222,
+				Protocol:      "udp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+				Stickiness:    linodego.StickinessSession,
+				UDPCheckPort:  80,
+			},
+			nil,
+		},
+		{
+			"default udp protocol with different port specific udp check port specified",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:           "udp",
+						annotations.AnnLinodePortConfigPrefix + "2222": `{"udp-check-port": "8080"}`,
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:          2222,
+				Protocol:      "udp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+				Stickiness:    linodego.StickinessSession,
+				UDPCheckPort:  8080,
+			},
+			nil,
+		},
+		{
+			"default udp protocol with different global udp check port specified",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol: "udp",
+						annotations.AnnLinodeUDPCheckPort:    "8080",
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:          2222,
+				Protocol:      "udp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+				Stickiness:    linodego.StickinessSession,
+				UDPCheckPort:  8080,
+			},
+			nil,
+		},
+		{
+			"invalid proxyprotocol specified for udp protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:      "udp",
+						annotations.AnnLinodeDefaultProxyProtocol: string(linodego.ProxyProtocolV1),
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:     2222,
+				Protocol: "udp",
+			},
+			fmt.Errorf("proxy protocol [%s] is not supported for UDP", string(linodego.ProxyProtocolV1)),
+		},
+		{
+			"algorithm source is not allowed for udp protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:  "udp",
+						annotations.AnnLinodeDefaultAlgorithm: string(linodego.AlgorithmSource),
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:          2222,
+				Protocol:      "udp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+			},
+			fmt.Errorf("invalid algorithm: %q specified for UDP protocol", string(linodego.AlgorithmSource)),
+		},
+		{
+			"udp_check_port should be within 1-65535",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:           "udp",
+						annotations.AnnLinodePortConfigPrefix + "2222": `{"udp-check-port": "88888"}`,
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:          2222,
+				Protocol:      "udp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
+			fmt.Errorf("UDPCheckPort must be between 1 and 65535, got %d", 88888),
+		},
+		{
+			"tls secret is not allowed for udp protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:           "udp",
+						annotations.AnnLinodePortConfigPrefix + "2222": `{"tls-secret-name": "test"}`,
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:          2222,
+				Protocol:      "udp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
+			fmt.Errorf("specifying TLS secret name is not supported for UDP"),
+		},
+		{
+			"no error on stickiness for tcp protocol, it gets ignored",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:          "tcp",
+						annotations.AnnLinodePortConfigPrefix + "443": `{"stickiness": "table"}`,
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "tcp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
+			nil,
+		},
+		{
+			"stickiness table is not allowed for udp protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:   "udp",
+						annotations.AnnLinodeDefaultStickiness: string(linodego.StickinessTable),
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolUDP,
+				Port:     2222,
+			},
+			portConfig{
+				Port:          2222,
+				Protocol:      "udp",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+				UDPCheckPort:  80,
+			},
+			fmt.Errorf("invalid stickiness: %q specified for UDP protocol", linodego.StickinessTable),
+		},
+		{
+			"stickiness session is not allowed for http protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:   "http",
+						annotations.AnnLinodeDefaultStickiness: string(linodego.StickinessSession),
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "http",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
+			fmt.Errorf("invalid stickiness: %q specified for HTTP protocol", linodego.StickinessSession),
+		},
+		{
+			"stickiness session is not allowed for https protocol",
+			&v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: randString(),
+					UID:  "abc123",
+					Annotations: map[string]string{
+						annotations.AnnLinodeDefaultProtocol:   "https",
+						annotations.AnnLinodeDefaultStickiness: string(linodego.StickinessSession),
+					},
+				},
+			},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "https",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+			},
+			fmt.Errorf("invalid stickiness: %q specified for HTTPS protocol", linodego.StickinessSession),
 		},
 		{
 			"default capitalized protocol specified",
@@ -2794,7 +3550,18 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{Port: 443, Protocol: "http", ProxyProtocol: linodego.ProxyProtocolNone},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "http",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+				Stickiness:    linodego.StickinessTable,
+			},
 			nil,
 		},
 		{
@@ -2808,7 +3575,14 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port: 443,
+			},
 			fmt.Errorf("invalid protocol: %q specified", "invalid"),
 		},
 		{
@@ -2823,7 +3597,18 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{Port: 443, Protocol: "http", ProxyProtocol: linodego.ProxyProtocolNone},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "http",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+				Stickiness:    linodego.StickinessTable,
+			},
 			nil,
 		},
 		{
@@ -2837,7 +3622,18 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{Port: 443, Protocol: "http", ProxyProtocol: linodego.ProxyProtocolNone},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{
+				Port:          443,
+				Protocol:      "http",
+				ProxyProtocol: linodego.ProxyProtocolNone,
+				Algorithm:     linodego.AlgorithmRoundRobin,
+				Stickiness:    linodego.StickinessTable,
+			},
 			nil,
 		},
 		{
@@ -2851,15 +3647,19 @@ func Test_getPortConfig(t *testing.T) {
 					},
 				},
 			},
-			portConfig{},
+			v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     443,
+			},
+			portConfig{Port: 443},
 			fmt.Errorf("invalid protocol: %q specified", "invalid"),
 		},
 	}
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			testPort := 443
-			portConfigResult, err := getPortConfig(test.service, testPort)
+			portConfigResult, err := getPortConfig(test.service, test.port)
 
 			if !reflect.DeepEqual(portConfigResult, test.expectedPortConfig) {
 				t.Error("unexpected port config")
@@ -2927,7 +3727,12 @@ func Test_getHealthCheckType(t *testing.T) {
 
 	for _, test := range testcases {
 		t.Run(test.name, func(t *testing.T) {
-			hType, err := getHealthCheckType(test.service)
+			port := v1.ServicePort{
+				Name:     "test",
+				Protocol: v1.ProtocolTCP,
+				Port:     int32(443),
+			}
+			hType, err := getHealthCheckType(test.service, port)
 			if !reflect.DeepEqual(hType, test.healthType) {
 				t.Error("unexpected health check type")
 				t.Logf("expected: %v", test.healthType)
@@ -3644,7 +4449,7 @@ func testUpdateLoadBalancerNoNodes(t *testing.T, client *linodego.Client, _ *fak
 	}
 	svc.Status.LoadBalancer = *makeLoadBalancerStatus(svc, nodeBalancer)
 	stubService(fakeClientset, svc)
-	svc.ObjectMeta.SetAnnotations(map[string]string{
+	svc.SetAnnotations(map[string]string{
 		annotations.AnnLinodeNodeBalancerID: strconv.Itoa(nodeBalancer.ID),
 	})
 
@@ -3657,6 +4462,70 @@ func testUpdateLoadBalancerNoNodes(t *testing.T, client *linodego.Client, _ *fak
 
 	if err := lb.UpdateLoadBalancer(t.Context(), "linodelb", svc, nodes); !stderrors.Is(err, errNoNodesAvailable) {
 		t.Errorf("UpdateLoadBalancer should return %v, got %v", errNoNodesAvailable, err)
+	}
+}
+
+func testGetNodeBalancerByStatus(t *testing.T, client *linodego.Client, _ *fakeAPI) {
+	t.Helper()
+
+	lb, assertion := newLoadbalancers(client, "us-west").(*loadbalancers)
+	if !assertion {
+		t.Error("type assertion failed")
+	}
+	fakeClientset := fake.NewSimpleClientset()
+	lb.kubeClient = fakeClientset
+
+	for _, test := range []struct {
+		name    string
+		service *v1.Service
+	}{
+		{
+			name: "hostname only",
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "hostname-ingress-" + randString(),
+					Annotations: map[string]string{annotations.AnnLinodeHostnameOnlyIngress: "true"},
+				},
+			},
+		},
+		{
+			name: "ipv4",
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "ipv4-ingress-" + randString(),
+				},
+			},
+		},
+		{
+			name: "ipv4 and ipv6",
+			service: &v1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "ipv6-ingress-" + randString(),
+					Annotations: map[string]string{annotations.AnnLinodeEnableIPv6Ingress: "true"},
+				},
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			expectedNB, err := lb.createNodeBalancer(t.Context(), "linodelb", test.service, []*linodego.NodeBalancerConfigCreateOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.service.Status.LoadBalancer = *makeLoadBalancerStatus(test.service, expectedNB)
+
+			actualNB, err := lb.getNodeBalancerByStatus(t.Context(), test.service)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if expectedNB.ID != actualNB.ID {
+				t.Error("unexpected nodebalancer ID")
+				t.Logf("expected: %v", expectedNB.ID)
+				t.Logf("actual: %v", actualNB.ID)
+			}
+
+			_ = lb.EnsureLoadBalancerDeleted(t.Context(), "linodelb", test.service)
+		})
 	}
 }
 

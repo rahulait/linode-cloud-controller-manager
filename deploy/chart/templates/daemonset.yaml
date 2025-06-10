@@ -17,6 +17,13 @@ spec:
     metadata:
       labels:
         app: ccm-linode
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       {{- if ne .Values.rbacEnabled false }}
       serviceAccountName: ccm-linode
@@ -82,6 +89,20 @@ spec:
             {{- $subnetNames := .Values.subnetNames }}
             {{- if and .Values.routeController .Values.routeController.subnetNames }}
             {{- $subnetNames = .Values.routeController.subnetNames }}
+            {{- end }}
+            {{- if .Values.disableNodeBalancerVPCBackends }}
+            - --disable-nodebalancer-vpc-backends={{ .Values.disableNodeBalancerVPCBackends }}
+            {{- end }}
+            {{- $nbvpcBackendIpv4SubnetName := .Values.nodeBalancerBackendIpv4SubnetName }}
+            {{- $nbvpcBackendIpv4SubnetID := .Values.nodeBalancerBackendIpv4SubnetID }}
+            {{- if and $nbvpcBackendIpv4SubnetName $nbvpcBackendIpv4SubnetID }}
+            {{- fail "Both nodeBalancerBackendIpv4SubnetName and nodeBalancerBackendIpv4SubnetID are set. Please use only one." }}
+            {{- end }}
+            {{- if $nbvpcBackendIpv4SubnetName }}
+            - --nodebalancer-backend-ipv4-subnet-name={{ $nbvpcBackendIpv4SubnetName }}
+            {{- end }}
+            {{- if $nbvpcBackendIpv4SubnetID }}
+            - --nodebalancer-backend-ipv4-subnet-id={{ $nbvpcBackendIpv4SubnetID }}
             {{- end }}
             {{- if .Values.routeController }}
             - --enable-route-controller=true
